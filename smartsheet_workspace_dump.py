@@ -18,10 +18,12 @@ import hashlib
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, date
@@ -75,8 +77,14 @@ def parse_args() -> argparse.Namespace:
                    help="Discover and list sheets without writing any file")
     p.add_argument("--log-every", type=int, default=10,
                    help="Log progress every N sheets (default: 10)")
-    p.add_argument("--workers",   type=int, default=MAX_WORKERS,
+    p.add_argument("--workers",       type=int, default=MAX_WORKERS,
                    help=f"Parallel fetch workers (default: {MAX_WORKERS})")
+    p.add_argument("--include-regex", default=None,
+                   help="Only export sheets whose name matches this regex (case-insensitive)")
+    p.add_argument("--exclude-regex", default=None,
+                   help="Skip sheets whose name matches this regex (case-insensitive)")
+    p.add_argument("--max-sheets",    type=int, default=None,
+                   help="Cap total sheets exported (useful for testing)")
     return p.parse_args()
 
 
@@ -297,13 +305,13 @@ def extract_sheet(client, record: SheetRecord, value_mode: str, logger) -> Optio
 
 
 # ── RENDERING ────────────────────────────────────────────────────────────────
-def style_header_row(ws):
+def style_header_row(ws, row: int = 1):
     fill  = PatternFill("solid", start_color="1F3864")
     font  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
     align = Alignment(horizontal="center", vertical="center")
-    for cell in ws[1]:
+    for cell in ws[row]:
         cell.fill, cell.font, cell.alignment = fill, font, align
-    ws.row_dimensions[1].height = 20
+    ws.row_dimensions[row].height = 20
 
 
 MAX_AUTOFIT_ROWS = 50   # sample cap to keep formatting fast on large sheets
@@ -323,23 +331,29 @@ def auto_fit_columns(ws):
 
 def build_index_sheet(wb, manifest: list, index_tab: str):
     idx = wb.create_sheet(index_tab, 0)
-    idx.append(["#", "Workspace", "Sheet Name", "Rows", "Smartsheet ID", "Link", "Generated"])
-    style_header_row(idx)
-    idx.cell(row=1, column=7).value = datetime.now().strftime("%Y-%m-%d %H:%M")
-    idx.cell(row=1, column=7).font  = Font(italic=True, name="Arial", size=9, color="FFFFFF")
+
+    # Row 1: metadata (not part of the data table)
+    idx.append(["", "", "", "", "", "", f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
+    meta_font = Font(italic=True, name="Arial", size=9, color="888888")
+    idx.cell(row=1, column=7).font = meta_font
+
+    # Row 2: column headers
+    idx.append(["#", "Workspace", "Sheet Name", "Rows", "Smartsheet ID", "Link", ""])
+    style_header_row(idx, row=2)
 
     for i, fs in enumerate(manifest, start=1):
         url = f"https://app.smartsheet.com/sheets/{fs.record.sheet_id}"
         idx.append([i, fs.record.workspace_name, fs.record.orig_name, len(fs.df), fs.record.sheet_id, "", ""])
+        data_row = i + 2  # offset by metadata row
 
-        name_cell = idx.cell(row=i + 1, column=3)
+        name_cell = idx.cell(row=data_row, column=3)
         needs_quote = bool(re.search(r"[ '\[\]!]", fs.tab_name))
         escaped     = fs.tab_name.replace("'", "''")
         safe        = f"'{escaped}'" if needs_quote else fs.tab_name
         name_cell.hyperlink = f"#{safe}!A1"
         name_cell.font      = Font(color="0070C0", underline="single", name="Arial", size=10)
 
-        link_cell           = idx.cell(row=i + 1, column=6)
+        link_cell           = idx.cell(row=data_row, column=6)
         link_cell.value     = "Open"
         link_cell.hyperlink = url
         link_cell.font      = Font(color="0070C0", underline="single", name="Arial", size=10)
@@ -409,14 +423,30 @@ def main():
 
     # Discovery
     records = discover_sheets(client, args.workspace_id, logger)
-    stats   = ExportStats(total_found=len(records))
+
+    # Apply name filters
+    if args.include_regex:
+        pat     = re.compile(args.include_regex, re.IGNORECASE)
+        before  = len(records)
+        records = [r for r in records if pat.search(r.orig_name)]
+        logger.info(f"--include-regex: kept {len(records)}/{before} sheet(s)")
+    if args.exclude_regex:
+        pat     = re.compile(args.exclude_regex, re.IGNORECASE)
+        before  = len(records)
+        records = [r for r in records if not pat.search(r.orig_name)]
+        logger.info(f"--exclude-regex: kept {len(records)}/{before} sheet(s)")
+    if args.max_sheets:
+        records = records[:args.max_sheets]
+        logger.info(f"--max-sheets: capped to {len(records)} sheet(s)")
+
+    stats = ExportStats(total_found=len(records))
 
     # Dry run — list sheets and exit
     if args.dry_run:
         logger.info("DRY RUN — no files will be written")
         for r in records:
             logger.info(f"  [{r.workspace_name}]  {r.orig_name}  (id={r.sheet_id})")
-        logger.info(f"Total: {len(records)} sheet(s) found")
+        logger.info(f"Total after filters: {len(records)} sheet(s)")
         return
 
     # Parallel extraction
@@ -464,7 +494,7 @@ def main():
 
     index_tab = safe_index_name(seen_tabs)
     stem, ext = os.path.splitext(args.output)
-    tmp_path  = f"{stem}_tmp_{os.getpid()}_{datetime.now().strftime('%H%M%S')}{ext or '.xlsx'}"
+    tmp_path  = f"{stem}_tmp_{uuid.uuid4().hex[:8]}{ext or '.xlsx'}"
 
     # Write to temp file (crash-safe: real file untouched until validated)
     with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
@@ -492,16 +522,23 @@ def main():
             msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
             logger.warning(msg)
             stats.validation_issues.append(msg)
-        # Sampled cell integrity: hash up to 5 data rows from source vs written
+        # Sampled cell integrity: first, middle, last + up to 3 random rows
         if len(fs.df) > 0:
+            n = len(fs.df)
+            candidates = sorted(set([
+                0,
+                n // 2,
+                n - 1,
+                *random.sample(range(n), min(3, n))
+            ]))
+
             def row_digest(values):
                 h = hashlib.sha256()
                 for v in values:
                     h.update(_normalize(v).encode())
                 return h.hexdigest()
 
-            sample_size = min(5, len(fs.df))
-            for row_idx in range(sample_size):
+            for row_idx in candidates:
                 src_digest  = row_digest(fs.df.iloc[row_idx].values)
                 xlsx_row    = next(ws_chk.iter_rows(
                     min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
