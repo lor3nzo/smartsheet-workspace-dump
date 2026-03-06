@@ -13,6 +13,8 @@ Usage:
     python smartsheet_workspace_dump.py --output-format csv
     python smartsheet_workspace_dump.py --output-format both
     python smartsheet_workspace_dump.py --include-regex "waverly" --max-sheets 5
+    python smartsheet_workspace_dump.py --format minimal --validation-level basic
+    python smartsheet_workspace_dump.py --format pretty --autofit-rows 200 --validation-level deep
 """
 
 from dotenv import load_dotenv
@@ -95,6 +97,12 @@ def parse_args() -> argparse.Namespace:
                    help="Append _Row_ID, _Parent_Row_ID, _Row_Number, _Created_At, _Modified_At to each sheet")
     p.add_argument("--output-format", choices=["xlsx", "csv", "parquet", "both", "all"], default="xlsx",
                    help="Output format: xlsx (default), csv, parquet, both (xlsx+csv), all (xlsx+csv+parquet)")
+    p.add_argument("--format",         choices=["pretty", "minimal"], default="pretty",
+                   help="Workbook formatting: pretty (default, styled+autofit) or minimal (freeze panes only, faster)")
+    p.add_argument("--autofit-rows",   type=int, default=None,
+                   help="Max rows to sample for column autofit (default: 50). Ignored under --format minimal.")
+    p.add_argument("--validation-level", choices=["basic", "standard", "deep"], default="standard",
+                   help="basic=row counts only, standard=+headers+sampled cells (default), deep=all rows hashed")
     return p.parse_args()
 
 
@@ -338,12 +346,12 @@ def style_header_row(ws, row: int = 1):
     ws.row_dimensions[row].height = 20
 
 
-MAX_AUTOFIT_ROWS = 50   # sample cap to keep formatting fast on large sheets
+MAX_AUTOFIT_ROWS = 50   # default sample cap — overridable via --autofit-rows
 
-def auto_fit_columns(ws):
+def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS):
     col_widths = {}
     for i, row in enumerate(ws.iter_rows()):
-        if i >= MAX_AUTOFIT_ROWS:
+        if i >= max_rows:
             break
         for cell in row:
             if cell.value:
@@ -421,7 +429,7 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         for msg in stats.errors:
             skipped_ws.append(["", msg])
         for msg in stats.validation_issues:
-            skipped_ws.append(["", f"ROW MISMATCH: {msg}"])
+            skipped_ws.append(["", f"VALIDATION ISSUE: {msg}"])
         auto_fit_columns(skipped_ws)
 
 
@@ -446,9 +454,31 @@ def _log_summary(stats: "ExportStats", logger, output: str = ""):
     logger.info("─" * 50)
 
 
+_WINDOWS_RESERVED = frozenset([
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+])
+MAX_FILENAME_LEN = 100  # conservative cross-platform cap
+
+
+def _safe_filename_stem(name: str, sheet_id: int) -> str:
+    """Return a filesystem-safe filename stem (no extension)."""
+    # Strip invalid chars
+    stem = re.sub(r"[\\/*?:\[\]\"<>|]", "_", name).strip()
+    # Remove trailing dots and spaces (Windows rejects these)
+    stem = stem.rstrip(". ")
+    # Replace Windows reserved names (case-insensitive)
+    if stem.upper() in _WINDOWS_RESERVED:
+        stem = f"{stem}_{sheet_id}"
+    # Enforce length cap
+    stem = stem[:MAX_FILENAME_LEN] if stem else f"Sheet_{sheet_id}"
+    return stem or f"Sheet_{sheet_id}"
+
+
 def _unique_filename(orig_name: str, sheet_id: int, seen: dict) -> str:
-    """Return a unique, filesystem-safe filename stem (no extension) for flat-file output."""
-    base = re.sub(r"[\\/*?:\[\]]", "_", orig_name).strip() or f"Sheet_{sheet_id}"
+    """Return a unique, filesystem-safe filename stem for flat-file output."""
+    base = _safe_filename_stem(orig_name, sheet_id)
     key  = base.lower()
     if key not in seen:
         seen[key] = 0
@@ -457,11 +487,26 @@ def _unique_filename(orig_name: str, sheet_id: int, seen: dict) -> str:
     return f"{base}_{seen[key]}"
 
 
+def _prepare_output_dir(out_dir: str, ext: str, logger) -> None:
+    """Create output directory, removing any stale files with the given extension from prior runs."""
+    if os.path.isdir(out_dir):
+        stale = [f for f in os.listdir(out_dir)
+                 if f.endswith(ext) and not f.startswith("_")]
+        for f in stale:
+            try:
+                os.remove(os.path.join(out_dir, f))
+            except OSError as e:
+                logger.warning(f"Could not remove stale file {f}: {e}")
+        if stale:
+            logger.info(f"Cleared {len(stale)} stale {ext} file(s) from {out_dir}/")
+    os.makedirs(out_dir, exist_ok=True)
+
+
 # ── FLAT-FILE WRITERS ────────────────────────────────────────────────────────
 def write_csv_output(manifest: list, stem: str, logger) -> str:
     """Write one CSV per sheet into {stem}_csv/. Returns the output directory path."""
     out_dir    = f"{stem}_csv"
-    os.makedirs(out_dir, exist_ok=True)
+    _prepare_output_dir(out_dir, ".csv", logger)
     seen_names = {}
     manifest_rows = []
     for fs in manifest:
@@ -493,7 +538,7 @@ def write_parquet_output(manifest: list, stem: str, logger) -> str:
         sys.exit(1)
 
     out_dir    = f"{stem}_parquet"
-    os.makedirs(out_dir, exist_ok=True)
+    _prepare_output_dir(out_dir, ".parquet", logger)
     seen_names = {}
     manifest_rows = []
     for fs in manifest:
@@ -532,8 +577,20 @@ def main():
     logger = setup_logging(args.log_level)
     log_n  = max(1, args.log_every)
 
-    # Fail fast if parquet requested but pyarrow not installed
+    # ── Fail-fast checks before any API work ────────────────────────────────
+    # 1. Parquet dependency
     _check_parquet_early(args.output_format, logger)
+
+    # 2. Regex patterns — compile and validate immediately
+    def _compile_regex(pattern: str, flag_name: str) -> re.Pattern:
+        try:
+            return re.compile(pattern, re.IGNORECASE)
+        except re.error as e:
+            logger.error(f"Invalid regex for {flag_name}: {repr(pattern)} — {e}")
+            sys.exit(1)
+
+    include_pat = _compile_regex(args.include_regex, "--include-regex") if args.include_regex else None
+    exclude_pat = _compile_regex(args.exclude_regex, "--exclude-regex") if args.exclude_regex else None
 
     # Auth — client created inside main, no module-level side effects
     token = os.environ.get("SMARTSHEET_API_TOKEN", "")
@@ -552,27 +609,21 @@ def main():
     # Discovery
     records = discover_sheets(client, args.workspace_id, logger)
 
-    # Apply name filters — validate regex patterns before any API work
-    def _compile_regex(pattern: str, flag_name: str) -> re.Pattern:
-        try:
-            return re.compile(pattern, re.IGNORECASE)
-        except re.error as e:
-            logger.error(f"Invalid regex for {flag_name}: {repr(pattern)} — {e}")
-            sys.exit(1)
-
-    if args.include_regex:
-        pat     = _compile_regex(args.include_regex, "--include-regex")
+    # Apply name filters (patterns already compiled and validated above)
+    if include_pat:
         before  = len(records)
-        records = [r for r in records if pat.search(r.orig_name)]
+        records = [r for r in records if include_pat.search(r.orig_name)]
         logger.info(f"--include-regex: kept {len(records)}/{before} sheet(s)")
-    if args.exclude_regex:
-        pat     = _compile_regex(args.exclude_regex, "--exclude-regex")
+    if exclude_pat:
         before  = len(records)
-        records = [r for r in records if not pat.search(r.orig_name)]
+        records = [r for r in records if not exclude_pat.search(r.orig_name)]
         logger.info(f"--exclude-regex: kept {len(records)}/{before} sheet(s)")
     if args.max_sheets:
         records = records[:args.max_sheets]
         logger.info(f"--max-sheets: capped to {len(records)} sheet(s)")
+
+    # Deterministic ordering: workspace → sheet name → sheet ID
+    records.sort(key=lambda r: (r.workspace_name.lower(), r.orig_name.lower(), r.sheet_id))
 
     stats = ExportStats(total_found=len(records))
 
@@ -659,8 +710,8 @@ def main():
             for fs in manifest:
                 fs.df.to_excel(writer, sheet_name=fs.tab_name, index=False)
 
-        # Post-write validation: row counts + headers + sampled cell hashes
-        logger.info("Validating output...")
+        # Post-write validation — depth controlled by --validation-level
+        logger.info(f"Validating output (level: {args.validation_level})...")
         wb_check = load_workbook(tmp_path, read_only=True)
         for fs in manifest:
             if fs.tab_name not in wb_check.sheetnames:
@@ -668,49 +719,71 @@ def main():
                 continue
             ws_chk  = wb_check[fs.tab_name]
             written = ws_chk.max_row - 1
+
+            # basic: row counts only
             if written != len(fs.df):
                 msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
                 logger.warning(msg)
                 stats.validation_issues.append(msg)
+
+            if args.validation_level == "basic":
+                continue
+
+            # standard+: header check
             written_headers  = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
             expected_headers = list(fs.df.columns)
             if written_headers != expected_headers:
                 msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
                 logger.warning(msg)
                 stats.validation_issues.append(msg)
-            if len(fs.df) > 0:
-                n          = len(fs.df)
-                candidates = sorted(set([0, n // 2, n - 1,
-                                         *random.sample(range(n), min(3, n))]))
 
-                def row_digest(values):
-                    h = hashlib.sha256()
-                    for v in values:
-                        h.update(_normalize(v).encode())
-                    return h.hexdigest()
+            if len(fs.df) == 0:
+                continue
 
-                for row_idx in candidates:
-                    src_digest  = row_digest(fs.df.iloc[row_idx].values)
-                    xlsx_row    = next(ws_chk.iter_rows(
-                        min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
-                    ))
-                    xlsx_digest = row_digest(xlsx_row)
-                    if src_digest != xlsx_digest:
-                        msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
-                        logger.warning(msg)
-                        stats.validation_issues.append(msg)
-                        break
+            def row_digest(values):
+                h = hashlib.sha256()
+                for v in values:
+                    h.update(_normalize(v).encode())
+                return h.hexdigest()
+
+            n = len(fs.df)
+
+            if args.validation_level == "standard":
+                # sampled rows: quartiles + 3 seeded random
+                rng        = random.Random(fs.record.sheet_id)
+                candidates = sorted(set([
+                    0, n // 4, n // 2, (3 * n) // 4, n - 1,
+                    *rng.sample(range(n), min(3, n))
+                ]))
+            else:
+                # deep: every row
+                candidates = range(n)
+
+            for row_idx in candidates:
+                src_digest  = row_digest(fs.df.iloc[row_idx].values)
+                xlsx_row    = next(ws_chk.iter_rows(
+                    min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                ))
+                xlsx_digest = row_digest(xlsx_row)
+                if src_digest != xlsx_digest:
+                    msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
+                    logger.warning(msg)
+                    stats.validation_issues.append(msg)
+                    break   # one warning per sheet regardless of level
         wb_check.close()
 
         # Apply formatting
-        logger.info("Applying formatting...")
+        autofit_rows = args.autofit_rows if args.autofit_rows is not None else MAX_AUTOFIT_ROWS
+        fmt_mode     = args.format
+        logger.info(f"Applying formatting (mode: {fmt_mode})...")
         wb = load_workbook(tmp_path)
         for fs in manifest:
             if fs.tab_name in wb.sheetnames:
                 ws = wb[fs.tab_name]
-                style_header_row(ws)
-                auto_fit_columns(ws)
-                ws.freeze_panes = "A2"
+                if fmt_mode == "pretty":
+                    style_header_row(ws)
+                    auto_fit_columns(ws, max_rows=autofit_rows)
+                ws.freeze_panes = "A2"   # always applied — zero cost, high usability value
         if index_tab in wb.sheetnames:
             del wb[index_tab]
         build_index_sheet(wb, manifest, index_tab)
