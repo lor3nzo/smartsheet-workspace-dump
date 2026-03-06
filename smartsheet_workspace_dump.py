@@ -103,7 +103,8 @@ def build_index_sheet(wb, sheet_manifest: list[tuple[str, str, int]]):
         idx.append([i, orig_name, row_count, ""])
         # Hyperlink to the tab
         cell = idx.cell(row=i + 1, column=2)
-        cell.hyperlink = f"#{tab_name}!A1"
+        safe = f"'{tab_name}'" if " " in tab_name else tab_name
+        cell.hyperlink = f"#{safe}!A1"
         cell.font = Font(color="0070C0", underline="single", name="Arial", size=10)
 
     auto_fit_columns(idx)
