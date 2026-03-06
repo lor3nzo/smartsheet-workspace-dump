@@ -14,16 +14,18 @@ Usage:
     python smartsheet_workspace_dump.py --output-format both
     python smartsheet_workspace_dump.py --include-regex "waverly" --max-sheets 5
     python smartsheet_workspace_dump.py --format minimal --validation-level basic
-    python smartsheet_workspace_dump.py --format pretty --autofit-rows 200 --validation-level deep
+    python smartsheet_workspace_dump.py --format pretty --autofit-rows 200 --autofit-max-width 80 --validation-level deep
+    python smartsheet_workspace_dump.py --no-index --no-summary --format minimal
+    python smartsheet_workspace_dump.py --validation-level deep --max-validation-issues 0
 """
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import warnings
-# Suppress deprecation warnings from the Smartsheet SDK itself (include_all, get_workspace, ssl options).
-# These are SDK internals -- not fixable from user code without forking the SDK.
-warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"smartsheet.*")
+# Suppress DeprecationWarnings from the Smartsheet SDK (include_all, get_workspace, ssl options).
+# These originate in SDK internals but surface at our call site -- filter by message text.
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=r".*(include_all|get_workspace|OP_NO_SSL|OP_NO_TLS).*")
 
 import argparse
 import hashlib
@@ -108,6 +110,14 @@ def parse_args() -> argparse.Namespace:
                    help="Max rows to sample for column autofit (default: 50, 0=disable). Ignored under --format minimal.")
     p.add_argument("--validation-level", choices=["basic", "standard", "deep"], default="standard",
                    help="basic=counts+headers, standard=+sampled cells (default), deep=all rows hashed (slow)")
+    p.add_argument("--no-index",   action="store_true", default=False,
+                   help="Omit the INDEX tab (faster for automated/scripted runs)")
+    p.add_argument("--no-summary", action="store_true", default=False,
+                   help="Omit the RUN_SUMMARY and SKIPPED tabs")
+    p.add_argument("--autofit-max-width", type=int, default=60,
+                   help="Maximum column width in autofit (default: 60). Ignored under --format minimal.")
+    p.add_argument("--max-validation-issues", type=int, default=10,
+                   help="Max issues logged per sheet in deep validation mode (default: 10, 0=unlimited)")
     return p.parse_args()
 
 
@@ -365,7 +375,7 @@ def style_header_row(ws, row: int = 1):
 
 MAX_AUTOFIT_ROWS = 50   # default sample cap -- overridable via --autofit-rows
 
-def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS):
+def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS, max_width: int = 60):
     if max_rows == 0:
         return   # auto-fit disabled
     col_widths = {}
@@ -377,11 +387,12 @@ def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS):
                 col_letter = get_column_letter(cell.column)
                 col_widths[col_letter] = max(col_widths.get(col_letter, 0), len(str(cell.value)))
     for col_letter, width in col_widths.items():
-        ws.column_dimensions[col_letter].width = min(width + 4, 60)
+        ws.column_dimensions[col_letter].width = min(width + 4, max_width)
 
 
 def build_index_sheet(wb, manifest: list, index_tab: str,
-                      fmt_mode: str = "pretty", autofit_rows: int = MAX_AUTOFIT_ROWS):
+                      fmt_mode: str = "pretty", autofit_rows: int = MAX_AUTOFIT_ROWS,
+                      max_width: int = 60):
     idx = wb.create_sheet(index_tab, 0)
 
     # Row 1: metadata (not part of the data table)
@@ -413,12 +424,13 @@ def build_index_sheet(wb, manifest: list, index_tab: str,
         link_cell.font      = Font(color="0070C0", underline="single", name="Arial", size=10)
 
     if fmt_mode == "pretty":
-        auto_fit_columns(idx, max_rows=autofit_rows)
+        auto_fit_columns(idx, max_rows=autofit_rows, max_width=max_width)
 
 
 # -- SUMMARY / SKIPPED TABS ---------------------------------------------------
 def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipped_name: str,
-                        fmt_mode: str = "pretty", autofit_rows: int = MAX_AUTOFIT_ROWS):
+                        fmt_mode: str = "pretty", autofit_rows: int = MAX_AUTOFIT_ROWS,
+                        max_width: int = 60):
     """RUN_SUMMARY tab: operational evidence inside the workbook."""
     ws = wb.create_sheet(summary_name)
     ws.column_dimensions["A"].width = 28
@@ -430,7 +442,11 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         ("Value mode",       args.values),
         ("Format mode",      args.format),
         ("Autofit rows",     args.autofit_rows if args.format == "pretty" else "n/a (minimal)"),
+        ("Autofit max width", args.autofit_max_width if args.format == "pretty" else "n/a (minimal)"),
         ("Validation level", args.validation_level),
+        ("Max issues/sheet", args.max_validation_issues if args.validation_level == "deep" else "n/a"),
+        ("Include index",    "no" if args.no_index else "yes"),
+        ("Include summary",  "no" if args.no_summary else "yes"),
         ("Workspace filter", args.workspace_id or "All"),
         ("Elapsed (s)",      f"{stats.elapsed:.1f}"),
         ("",                 ""),
@@ -460,7 +476,7 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         for msg in stats.validation_issues:
             skipped_ws.append(["", f"VALIDATION ISSUE: {msg}"])
         if fmt_mode == "pretty":
-            auto_fit_columns(skipped_ws, max_rows=autofit_rows)
+            auto_fit_columns(skipped_ws, max_rows=autofit_rows, max_width=max_width)
 
 
 # -- SUMMARY LOGGER -----------------------------------------------------------
@@ -610,6 +626,12 @@ def main():
     # -- Argument validation --------------------------------------------------
     if args.autofit_rows < 0:
         logger.error("--autofit-rows must be >= 0 (use 0 to disable auto-fit)")
+        sys.exit(1)
+    if args.autofit_max_width < 1:
+        logger.error("--autofit-max-width must be >= 1")
+        sys.exit(1)
+    if args.max_validation_issues < 0:
+        logger.error("--max-validation-issues must be >= 0 (use 0 for unlimited)")
         sys.exit(1)
 
     _, out_ext = os.path.splitext(args.output)
@@ -808,7 +830,8 @@ def main():
 
             else:
                 # deep: every row -- report first N mismatches per sheet + total count
-                MAX_ISSUES_PER_SHEET = 10
+                # 0 = unlimited
+                issue_cap  = args.max_validation_issues
                 mismatch_count = 0
                 for row_idx in range(n):
                     src_digest  = row_digest(fs.df.iloc[row_idx].values)
@@ -817,22 +840,24 @@ def main():
                     ))
                     if src_digest != row_digest(xlsx_row):
                         mismatch_count += 1
-                        if mismatch_count <= MAX_ISSUES_PER_SHEET:
+                        if issue_cap == 0 or mismatch_count <= issue_cap:
                             msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}"
                             logger.warning(msg)
                             stats.validation_issues.append(msg)
                 if mismatch_count > 0:
-                    summary_msg = (
-                        f"  -> {mismatch_count}/{n} row(s) with data divergence "
-                        f"in '{fs.record.orig_name}'"
-                        + (f" (showing first {MAX_ISSUES_PER_SHEET})"
-                           if mismatch_count > MAX_ISSUES_PER_SHEET else "")
+                    cap_note = (
+                        f" (showing first {issue_cap})"
+                        if issue_cap > 0 and mismatch_count > issue_cap else ""
                     )
-                    logger.warning(summary_msg)
+                    logger.warning(
+                        f"  -> {mismatch_count}/{n} row(s) with data divergence "
+                        f"in '{fs.record.orig_name}'{cap_note}"
+                    )
         wb_check.close()
 
         # Apply formatting
         autofit_rows = args.autofit_rows   # 0 = disabled, N = row cap
+        max_width    = args.autofit_max_width
         fmt_mode     = args.format
         logger.info(f"Applying formatting (mode: {fmt_mode})...")
         wb = load_workbook(tmp_path)
@@ -841,16 +866,21 @@ def main():
                 ws = wb[fs.tab_name]
                 if fmt_mode == "pretty":
                     style_header_row(ws)
-                    auto_fit_columns(ws, max_rows=autofit_rows)
+                    auto_fit_columns(ws, max_rows=autofit_rows, max_width=max_width)
                 ws.freeze_panes = "A2"   # always applied -- zero cost, high usability value
-        if index_tab in wb.sheetnames:
-            del wb[index_tab]
-        build_index_sheet(wb, manifest, index_tab,
-                          fmt_mode=fmt_mode, autofit_rows=autofit_rows)
-        summary_name = safe_summary_name(seen_tabs)
-        skipped_name = safe_skipped_name(seen_tabs)
-        build_summary_sheet(wb, stats, args, summary_name, skipped_name,
-                            fmt_mode=fmt_mode, autofit_rows=autofit_rows)
+        if not args.no_index:
+            if index_tab in wb.sheetnames:
+                del wb[index_tab]
+            build_index_sheet(wb, manifest, index_tab,
+                              fmt_mode=fmt_mode, autofit_rows=autofit_rows, max_width=max_width)
+        elif index_tab in wb.sheetnames:
+            del wb[index_tab]   # placeholder was written to ExcelWriter; remove it
+
+        if not args.no_summary:
+            summary_name = safe_summary_name(seen_tabs)
+            skipped_name = safe_skipped_name(seen_tabs)
+            build_summary_sheet(wb, stats, args, summary_name, skipped_name,
+                                fmt_mode=fmt_mode, autofit_rows=autofit_rows, max_width=max_width)
         wb.save(tmp_path)
 
         # Archive prior output, then atomically promote temp file
