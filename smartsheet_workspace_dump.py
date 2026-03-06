@@ -1,5 +1,5 @@
 """
-Smartsheet Full Workspace Dump → Excel / CSV / Parquet
+Smartsheet Full Workspace Dump -> Excel / CSV / Parquet
 
 Requirements:
     pip install smartsheet-python-sdk openpyxl pandas python-dotenv
@@ -19,6 +19,11 @@ Usage:
 
 from dotenv import load_dotenv
 load_dotenv()
+
+import warnings
+# Suppress deprecation warnings from the Smartsheet SDK itself (include_all, get_workspace, ssl options).
+# These are SDK internals -- not fixable from user code without forking the SDK.
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"smartsheet.*")
 
 import argparse
 import hashlib
@@ -42,7 +47,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-# ── CONSTANTS ────────────────────────────────────────────────────────────────
+# -- CONSTANTS ----------------------------------------------------------------
 DEFAULT_OUTPUT   = "smartsheet.xlsx"
 ARCHIVE_DIR      = "archive"
 LOG_FILE         = "smartsheet_dump.log"
@@ -52,11 +57,11 @@ MAX_WORKERS      = 5
 INDENT_COL       = "_Indent_Level"
 INDEX_TAB        = "INDEX"
 ROW_META_COLS    = ["_Row_ID", "_Parent_Row_ID", "_Row_Number", "_Created_At", "_Modified_At"]
-# ────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 
 def _normalize(v) -> str:
-    """Normalize cell values for write validation: NaN/None → '', whole floats → int, dates → ISO."""
+    """Normalize cell values for write validation: NaN/None -> '', whole floats -> int, dates -> ISO."""
     if v is None:
         return ""
     if isinstance(v, float):
@@ -71,7 +76,7 @@ def _normalize(v) -> str:
     return str(v).strip()
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# -- CLI ----------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dump Smartsheet workspaces to Excel")
     p.add_argument("--workspace-id", default=os.environ.get("SMARTSHEET_WORKSPACE_ID"),
@@ -106,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ── LOGGING ──────────────────────────────────────────────────────────────────
+# -- LOGGING ------------------------------------------------------------------
 def setup_logging(level: str) -> logging.Logger:
     logger    = logging.getLogger("ss_dump")
     log_level = getattr(logging, level, logging.INFO)
@@ -123,7 +128,7 @@ def setup_logging(level: str) -> logging.Logger:
     return logger
 
 
-# ── DATA CLASSES ─────────────────────────────────────────────────────────────
+# -- DATA CLASSES -------------------------------------------------------------
 @dataclass
 class SheetRecord:
     orig_name:      str
@@ -147,31 +152,43 @@ class ExportStats:
     elapsed:           float = 0.0
 
 
-# ── RETRY ────────────────────────────────────────────────────────────────────
+# -- RETRY --------------------------------------------------------------------
+TRANSIENT_API_CODES = frozenset([429, 502, 503])  # 502 = Bad Gateway (transient infra error)
+
 def with_retry(fn, *args, logger, **kwargs):
-    """Call fn(*args, **kwargs) with exponential backoff on transient errors."""
+    """Call fn(*args, **kwargs) with exponential backoff + jitter on transient errors."""
     for attempt in range(1, MAX_RETRIES + 2):
         try:
             return fn(*args, **kwargs)
         except smartsheet.exceptions.ApiError as e:
             code = getattr(getattr(e, "error", None), "status_code", None)
-            if attempt <= MAX_RETRIES and code in (429, 503):
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            if attempt <= MAX_RETRIES and code in TRANSIENT_API_CODES:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
                 logger.warning(f"API {code} (attempt {attempt}/{MAX_RETRIES}), retry in {delay:.1f}s")
+                time.sleep(delay)
+            else:
+                raise
+        except TypeError as e:
+            # SDK bug: malformed API response (e.g. 502 with no body) causes
+            # NoneType concatenation inside smartsheet.py before ApiError is raised.
+            # Treat as transient -- retry up to MAX_RETRIES times.
+            if attempt <= MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                logger.warning(f"SDK TypeError on malformed response (attempt {attempt}/{MAX_RETRIES}), retry in {delay:.1f}s: {e}")
                 time.sleep(delay)
             else:
                 raise
         except (ConnectionError, TimeoutError, OSError,
                 smartsheet.exceptions.SystemMaintenanceError) as e:
             if attempt <= MAX_RETRIES:
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
                 logger.warning(f"Network error (attempt {attempt}/{MAX_RETRIES}), retry in {delay:.1f}s: {type(e).__name__}: {e}")
                 time.sleep(delay)
             else:
                 raise
 
 
-# ── NAMING ───────────────────────────────────────────────────────────────────
+# -- NAMING -------------------------------------------------------------------
 def sanitize_sheet_name(name: str, fallback: str = "Sheet") -> str:
     name = re.sub(r"[\\/*?\[\]:]", "", name).strip()
     return name[:31] if name else fallback[:31]
@@ -208,7 +225,7 @@ def safe_skipped_name(seen: dict) -> str:
     return _safe_reserved_name("SKIPPED", seen)
 
 
-# ── DISCOVERY ────────────────────────────────────────────────────────────────
+# -- DISCOVERY ----------------------------------------------------------------
 def _collect_from_folder(folder, workspace_name: str) -> list:
     records = []
     if getattr(folder, "sheets", None):
@@ -253,7 +270,7 @@ def discover_sheets(client, workspace_id: Optional[str], logger) -> list:
 
     logger.info(f"Discovered {len(records)} sheet(s) across {len(workspaces)} workspace(s)")
 
-    # Final dedup pass — guard against duplicates across recursive paths
+    # Final dedup pass -- guard against duplicates across recursive paths
     seen_ids, deduped = set(), []
     for r in records:
         if r.sheet_id not in seen_ids:
@@ -264,9 +281,9 @@ def discover_sheets(client, workspace_id: Optional[str], logger) -> list:
     return deduped
 
 
-# ── EXTRACTION ───────────────────────────────────────────────────────────────
+# -- EXTRACTION ---------------------------------------------------------------
 def _resolve_col_titles(columns) -> dict:
-    """Map col.id → unique title; append _2, _3 for duplicate column names."""
+    """Map col.id -> unique title; append _2, _3 for duplicate column names."""
     seen, result = {}, {}
     for col in columns:
         title = col.title or f"Col_{col.id}"
@@ -336,7 +353,7 @@ def extract_sheet(client, record: SheetRecord, value_mode: str, logger,
     return pd.DataFrame(rows, columns=all_cols)
 
 
-# ── RENDERING ────────────────────────────────────────────────────────────────
+# -- RENDERING ----------------------------------------------------------------
 def style_header_row(ws, row: int = 1):
     fill  = PatternFill("solid", start_color="1F3864")
     font  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
@@ -346,7 +363,7 @@ def style_header_row(ws, row: int = 1):
     ws.row_dimensions[row].height = 20
 
 
-MAX_AUTOFIT_ROWS = 50   # default sample cap — overridable via --autofit-rows
+MAX_AUTOFIT_ROWS = 50   # default sample cap -- overridable via --autofit-rows
 
 def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS):
     if max_rows == 0:
@@ -363,17 +380,20 @@ def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS):
         ws.column_dimensions[col_letter].width = min(width + 4, 60)
 
 
-def build_index_sheet(wb, manifest: list, index_tab: str):
+def build_index_sheet(wb, manifest: list, index_tab: str,
+                      fmt_mode: str = "pretty", autofit_rows: int = MAX_AUTOFIT_ROWS):
     idx = wb.create_sheet(index_tab, 0)
 
     # Row 1: metadata (not part of the data table)
     idx.append(["", "", "", "", "", "", f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
-    meta_font = Font(italic=True, name="Arial", size=9, color="888888")
-    idx.cell(row=1, column=7).font = meta_font
+    if fmt_mode == "pretty":
+        meta_font = Font(italic=True, name="Arial", size=9, color="888888")
+        idx.cell(row=1, column=7).font = meta_font
 
     # Row 2: column headers
     idx.append(["#", "Workspace", "Sheet Name", "Rows", "Smartsheet ID", "Link", ""])
-    style_header_row(idx, row=2)
+    if fmt_mode == "pretty":
+        style_header_row(idx, row=2)
 
     for i, fs in enumerate(manifest, start=1):
         url = f"https://app.smartsheet.com/sheets/{fs.record.sheet_id}"
@@ -392,11 +412,13 @@ def build_index_sheet(wb, manifest: list, index_tab: str):
         link_cell.hyperlink = url
         link_cell.font      = Font(color="0070C0", underline="single", name="Arial", size=10)
 
-    auto_fit_columns(idx)
+    if fmt_mode == "pretty":
+        auto_fit_columns(idx, max_rows=autofit_rows)
 
 
-# ── SUMMARY / SKIPPED TABS ───────────────────────────────────────────────────
-def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipped_name: str):
+# -- SUMMARY / SKIPPED TABS ---------------------------------------------------
+def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipped_name: str,
+                        fmt_mode: str = "pretty", autofit_rows: int = MAX_AUTOFIT_ROWS):
     """RUN_SUMMARY tab: operational evidence inside the workbook."""
     ws = wb.create_sheet(summary_name)
     ws.column_dimensions["A"].width = 28
@@ -421,26 +443,29 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
     for r in rows:
         ws.append(r)
 
-    style_header = Font(bold=True, name="Arial", size=10)
-    for row in ws.iter_rows(min_col=1, max_col=1):
-        for cell in row:
-            if cell.value:
-                cell.font = style_header
+    if fmt_mode == "pretty":
+        style_header = Font(bold=True, name="Arial", size=10)
+        for row in ws.iter_rows(min_col=1, max_col=1):
+            for cell in row:
+                if cell.value:
+                    cell.font = style_header
 
     if stats.errors or stats.validation_issues:
         skipped_ws = wb.create_sheet(skipped_name)
         skipped_ws.append(["Sheet Name", "Reason"])
-        style_header_row(skipped_ws)
+        if fmt_mode == "pretty":
+            style_header_row(skipped_ws)
         for msg in stats.errors:
             skipped_ws.append(["", msg])
         for msg in stats.validation_issues:
             skipped_ws.append(["", f"VALIDATION ISSUE: {msg}"])
-        auto_fit_columns(skipped_ws)
+        if fmt_mode == "pretty":
+            auto_fit_columns(skipped_ws, max_rows=autofit_rows)
 
 
-# ── SUMMARY LOGGER ───────────────────────────────────────────────────────────
+# -- SUMMARY LOGGER -----------------------------------------------------------
 def _log_summary(stats: "ExportStats", logger, output: str = ""):
-    logger.info("─" * 50)
+    logger.info("-" * 50)
     if output:
         logger.info(f"Output:            {output}")
     logger.info(f"Elapsed:           {stats.elapsed:.1f}s")
@@ -456,7 +481,7 @@ def _log_summary(stats: "ExportStats", logger, output: str = ""):
         logger.error("Errors:")
         for e in stats.errors:
             logger.error(f"  {e}")
-    logger.info("─" * 50)
+    logger.info("-" * 50)
 
 
 _WINDOWS_RESERVED = frozenset([
@@ -507,7 +532,7 @@ def _prepare_output_dir(out_dir: str, ext: str, logger) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
 
-# ── FLAT-FILE WRITERS ────────────────────────────────────────────────────────
+# -- FLAT-FILE WRITERS --------------------------------------------------------
 def write_csv_output(manifest: list, stem: str, logger) -> str:
     """Write one CSV per sheet into {stem}_csv/. Returns the output directory path."""
     out_dir    = f"{stem}_csv"
@@ -530,14 +555,14 @@ def write_csv_output(manifest: list, stem: str, logger) -> str:
     manifest_path = os.path.join(out_dir, "_manifest.csv")
     pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
 
-    logger.info(f"CSV output written → {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
+    logger.info(f"CSV output written -> {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
     return out_dir
 
 
 def write_parquet_output(manifest: list, stem: str, logger) -> str:
     """Write one Parquet file per sheet into {stem}_parquet/. Returns the output directory path."""
     try:
-        import pyarrow  # noqa: F401 — presence check only
+        import pyarrow  # noqa: F401 -- presence check only
     except ImportError:
         logger.error("parquet output requires pyarrow. Install it with: pip install pyarrow")
         sys.exit(1)
@@ -562,7 +587,7 @@ def write_parquet_output(manifest: list, stem: str, logger) -> str:
     manifest_path = os.path.join(out_dir, "_manifest.csv")
     pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
 
-    logger.info(f"Parquet output written → {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
+    logger.info(f"Parquet output written -> {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
     return out_dir
 
 
@@ -576,33 +601,41 @@ def _check_parquet_early(fmt: str, logger):
             sys.exit(1)
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+# -- MAIN ---------------------------------------------------------------------
 def main():
     args   = parse_args()
     logger = setup_logging(args.log_level)
     log_n  = max(1, args.log_every)
 
-    # ── Argument validation ──────────────────────────────────────────────────
+    # -- Argument validation --------------------------------------------------
     if args.autofit_rows < 0:
         logger.error("--autofit-rows must be >= 0 (use 0 to disable auto-fit)")
         sys.exit(1)
 
-    # ── Fail-fast checks before any API work ────────────────────────────────
+    _, out_ext = os.path.splitext(args.output)
+    if args.output_format in ("xlsx", "both", "all") and out_ext.lower() not in ("", ".xlsx"):
+        logger.error(
+            f"--output '{args.output}' has extension '{out_ext}'. "
+            f"XLSX output requires a .xlsx filename (e.g. smartsheet.xlsx)."
+        )
+        sys.exit(1)
+
+    # -- Fail-fast checks before any API work --------------------------------
     # 1. Parquet dependency
     _check_parquet_early(args.output_format, logger)
 
-    # 2. Regex patterns — compile and validate immediately
+    # 2. Regex patterns -- compile and validate immediately
     def _compile_regex(pattern: str, flag_name: str) -> re.Pattern:
         try:
             return re.compile(pattern, re.IGNORECASE)
         except re.error as e:
-            logger.error(f"Invalid regex for {flag_name}: {repr(pattern)} — {e}")
+            logger.error(f"Invalid regex for {flag_name}: {repr(pattern)} -- {e}")
             sys.exit(1)
 
     include_pat = _compile_regex(args.include_regex, "--include-regex") if args.include_regex else None
     exclude_pat = _compile_regex(args.exclude_regex, "--exclude-regex") if args.exclude_regex else None
 
-    # Auth — client created inside main, no module-level side effects
+    # Auth -- client created inside main, no module-level side effects
     token = os.environ.get("SMARTSHEET_API_TOKEN", "")
     if not token:
         logger.error("SMARTSHEET_API_TOKEN is not set. Add it to your .env file.")
@@ -632,14 +665,14 @@ def main():
         records = records[:args.max_sheets]
         logger.info(f"--max-sheets: capped to {len(records)} sheet(s)")
 
-    # Deterministic ordering: workspace → sheet name → sheet ID
+    # Deterministic ordering: workspace -> sheet name -> sheet ID
     records.sort(key=lambda r: (r.workspace_name.lower(), r.orig_name.lower(), r.sheet_id))
 
     stats = ExportStats(total_found=len(records))
 
-    # Dry run — list sheets and exit
+    # Dry run -- list sheets and exit
     if args.dry_run:
-        logger.info("DRY RUN — no files will be written")
+        logger.info("DRY RUN -- no files will be written")
         for r in records:
             logger.info(f"  [{r.workspace_name}]  {r.orig_name}  (id={r.sheet_id})")
         logger.info(f"Total after filters: {len(records)} sheet(s)")
@@ -647,12 +680,12 @@ def main():
 
     # Parallel extraction
     t_start  = time.time()
-    fetched  = {}   # sheet_id → (record, df | None, error | None)
+    fetched  = {}   # sheet_id -> (record, df | None, error | None)
 
     logger.info(f"Fetching {len(records)} sheet(s) with up to {max(1, args.workers)} parallel workers...")
 
     def fetch_one(record):
-        # Each thread gets its own client instance — avoids shared-state concurrency risk
+        # Each thread gets its own client instance -- avoids shared-state concurrency risk
         thread_client = smartsheet.Smartsheet(token)
         thread_client.errors_as_exceptions(True)
         return record, extract_sheet(thread_client, record, args.values, logger,
@@ -696,21 +729,21 @@ def main():
     stats.exported = len(manifest)
     stats.elapsed  = time.time() - t_start
 
-    # ── CSV output ──────────────────────────────────────────────────────────
+    # -- CSV output ----------------------------------------------------------
     if fmt in ("csv", "both", "all"):
         write_csv_output(manifest, stem, logger)
         if fmt == "csv":
             _log_summary(stats, logger, output=f"{stem}_csv/")
             return
 
-    # ── Parquet output ──────────────────────────────────────────────────────
+    # -- Parquet output ------------------------------------------------------
     if fmt in ("parquet", "all"):
         write_parquet_output(manifest, stem, logger)
         if fmt == "parquet":
             _log_summary(stats, logger, output=f"{stem}_parquet/")
             return
 
-    # ── XLSX output (default; also written for "both" and "all") ─────────────
+    # -- XLSX output (default; also written for "both" and "all") -------------
     if fmt in ("xlsx", "both", "all"):
         tmp_path = f"{stem}_tmp_{uuid.uuid4().hex[:8]}{ext or '.xlsx'}"
 
@@ -720,12 +753,12 @@ def main():
             for fs in manifest:
                 fs.df.to_excel(writer, sheet_name=fs.tab_name, index=False)
 
-        # Post-write validation — depth controlled by --validation-level
+        # Post-write validation -- depth controlled by --validation-level
         logger.info(f"Validating output (level: {args.validation_level})...")
         wb_check = load_workbook(tmp_path, read_only=True)
 
         def row_digest(values) -> str:
-            """Deterministic SHA-256 digest using unit-separator join — avoids value-boundary collisions."""
+            """Deterministic SHA-256 digest using unit-separator join -- avoids value-boundary collisions."""
             payload = "\x1f".join(_normalize(v) for v in values)
             return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -756,7 +789,7 @@ def main():
             n = len(fs.df)
 
             if args.validation_level == "standard":
-                # Sampled rows: quartiles + 3 seeded random — reproducible per sheet
+                # Sampled rows: quartiles + 3 seeded random -- reproducible per sheet
                 rng        = random.Random(fs.record.sheet_id)
                 candidates = sorted(set([
                     0, n // 4, n // 2, (3 * n) // 4, n - 1,
@@ -774,7 +807,8 @@ def main():
                         break   # one warning per sheet in standard mode
 
             else:
-                # deep: every row — report all mismatches + total
+                # deep: every row -- report first N mismatches per sheet + total count
+                MAX_ISSUES_PER_SHEET = 10
                 mismatch_count = 0
                 for row_idx in range(n):
                     src_digest  = row_digest(fs.df.iloc[row_idx].values)
@@ -783,13 +817,18 @@ def main():
                     ))
                     if src_digest != row_digest(xlsx_row):
                         mismatch_count += 1
-                        msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}"
-                        logger.warning(msg)
-                        stats.validation_issues.append(msg)
+                        if mismatch_count <= MAX_ISSUES_PER_SHEET:
+                            msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}"
+                            logger.warning(msg)
+                            stats.validation_issues.append(msg)
                 if mismatch_count > 0:
-                    logger.warning(
-                        f"  → {mismatch_count}/{n} row(s) with data divergence in '{fs.record.orig_name}'"
+                    summary_msg = (
+                        f"  -> {mismatch_count}/{n} row(s) with data divergence "
+                        f"in '{fs.record.orig_name}'"
+                        + (f" (showing first {MAX_ISSUES_PER_SHEET})"
+                           if mismatch_count > MAX_ISSUES_PER_SHEET else "")
                     )
+                    logger.warning(summary_msg)
         wb_check.close()
 
         # Apply formatting
@@ -803,13 +842,15 @@ def main():
                 if fmt_mode == "pretty":
                     style_header_row(ws)
                     auto_fit_columns(ws, max_rows=autofit_rows)
-                ws.freeze_panes = "A2"   # always applied — zero cost, high usability value
+                ws.freeze_panes = "A2"   # always applied -- zero cost, high usability value
         if index_tab in wb.sheetnames:
             del wb[index_tab]
-        build_index_sheet(wb, manifest, index_tab)
+        build_index_sheet(wb, manifest, index_tab,
+                          fmt_mode=fmt_mode, autofit_rows=autofit_rows)
         summary_name = safe_summary_name(seen_tabs)
         skipped_name = safe_skipped_name(seen_tabs)
-        build_summary_sheet(wb, stats, args, summary_name, skipped_name)
+        build_summary_sheet(wb, stats, args, summary_name, skipped_name,
+                            fmt_mode=fmt_mode, autofit_rows=autofit_rows)
         wb.save(tmp_path)
 
         # Archive prior output, then atomically promote temp file
@@ -820,9 +861,9 @@ def main():
             old_backup = os.path.join(ARCHIVE_DIR, f"{stem2}_{ts}.xlsx")
             try:
                 shutil.copy2(args.output, old_backup)
-                logger.info(f"Archived previous output → {old_backup}")
+                logger.info(f"Archived previous output -> {old_backup}")
             except Exception as e:
-                logger.warning(f"Archive failed ({e}). Continuing — previous file will be overwritten.")
+                logger.warning(f"Archive failed ({e}). Continuing -- previous file will be overwritten.")
 
         try:
             os.replace(tmp_path, args.output)
@@ -830,7 +871,7 @@ def main():
             logger.error(f"Failed to promote temp file: {e}")
             sys.exit(1)
 
-        logger.info(f"XLSX written → {args.output}")
+        logger.info(f"XLSX written -> {args.output}")
 
     _log_summary(stats, logger, output=args.output)
 
