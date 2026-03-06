@@ -99,10 +99,10 @@ def parse_args() -> argparse.Namespace:
                    help="Output format: xlsx (default), csv, parquet, both (xlsx+csv), all (xlsx+csv+parquet)")
     p.add_argument("--format",         choices=["pretty", "minimal"], default="pretty",
                    help="Workbook formatting: pretty (default, styled+autofit) or minimal (freeze panes only, faster)")
-    p.add_argument("--autofit-rows",   type=int, default=None,
-                   help="Max rows to sample for column autofit (default: 50). Ignored under --format minimal.")
+    p.add_argument("--autofit-rows",   type=int, default=50,
+                   help="Max rows to sample for column autofit (default: 50, 0=disable). Ignored under --format minimal.")
     p.add_argument("--validation-level", choices=["basic", "standard", "deep"], default="standard",
-                   help="basic=row counts only, standard=+headers+sampled cells (default), deep=all rows hashed")
+                   help="basic=counts+headers, standard=+sampled cells (default), deep=all rows hashed (slow)")
     return p.parse_args()
 
 
@@ -349,6 +349,8 @@ def style_header_row(ws, row: int = 1):
 MAX_AUTOFIT_ROWS = 50   # default sample cap — overridable via --autofit-rows
 
 def auto_fit_columns(ws, max_rows: int = MAX_AUTOFIT_ROWS):
+    if max_rows == 0:
+        return   # auto-fit disabled
     col_widths = {}
     for i, row in enumerate(ws.iter_rows()):
         if i >= max_rows:
@@ -404,6 +406,9 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         ("Run timestamp",    datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         ("Output file",      args.output),
         ("Value mode",       args.values),
+        ("Format mode",      args.format),
+        ("Autofit rows",     args.autofit_rows if args.format == "pretty" else "n/a (minimal)"),
+        ("Validation level", args.validation_level),
         ("Workspace filter", args.workspace_id or "All"),
         ("Elapsed (s)",      f"{stats.elapsed:.1f}"),
         ("",                 ""),
@@ -577,6 +582,11 @@ def main():
     logger = setup_logging(args.log_level)
     log_n  = max(1, args.log_every)
 
+    # ── Argument validation ──────────────────────────────────────────────────
+    if args.autofit_rows < 0:
+        logger.error("--autofit-rows must be >= 0 (use 0 to disable auto-fit)")
+        sys.exit(1)
+
     # ── Fail-fast checks before any API work ────────────────────────────────
     # 1. Parquet dependency
     _check_parquet_early(args.output_format, logger)
@@ -713,6 +723,12 @@ def main():
         # Post-write validation — depth controlled by --validation-level
         logger.info(f"Validating output (level: {args.validation_level})...")
         wb_check = load_workbook(tmp_path, read_only=True)
+
+        def row_digest(values) -> str:
+            """Deterministic SHA-256 digest using unit-separator join — avoids value-boundary collisions."""
+            payload = "\x1f".join(_normalize(v) for v in values)
+            return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
         for fs in manifest:
             if fs.tab_name not in wb_check.sheetnames:
                 stats.validation_issues.append(f"Missing tab '{fs.record.orig_name}'")
@@ -720,16 +736,13 @@ def main():
             ws_chk  = wb_check[fs.tab_name]
             written = ws_chk.max_row - 1
 
-            # basic: row counts only
+            # All levels: row count
             if written != len(fs.df):
                 msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
                 logger.warning(msg)
                 stats.validation_issues.append(msg)
 
-            if args.validation_level == "basic":
-                continue
-
-            # standard+: header check
+            # All levels: headers (cheap, catches high-value failures)
             written_headers  = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
             expected_headers = list(fs.df.columns)
             if written_headers != expected_headers:
@@ -737,43 +750,50 @@ def main():
                 logger.warning(msg)
                 stats.validation_issues.append(msg)
 
-            if len(fs.df) == 0:
+            if args.validation_level == "basic" or len(fs.df) == 0:
                 continue
-
-            def row_digest(values):
-                h = hashlib.sha256()
-                for v in values:
-                    h.update(_normalize(v).encode())
-                return h.hexdigest()
 
             n = len(fs.df)
 
             if args.validation_level == "standard":
-                # sampled rows: quartiles + 3 seeded random
+                # Sampled rows: quartiles + 3 seeded random — reproducible per sheet
                 rng        = random.Random(fs.record.sheet_id)
                 candidates = sorted(set([
                     0, n // 4, n // 2, (3 * n) // 4, n - 1,
                     *rng.sample(range(n), min(3, n))
                 ]))
-            else:
-                # deep: every row
-                candidates = range(n)
+                for row_idx in candidates:
+                    src_digest  = row_digest(fs.df.iloc[row_idx].values)
+                    xlsx_row    = next(ws_chk.iter_rows(
+                        min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                    ))
+                    if src_digest != row_digest(xlsx_row):
+                        msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
+                        logger.warning(msg)
+                        stats.validation_issues.append(msg)
+                        break   # one warning per sheet in standard mode
 
-            for row_idx in candidates:
-                src_digest  = row_digest(fs.df.iloc[row_idx].values)
-                xlsx_row    = next(ws_chk.iter_rows(
-                    min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
-                ))
-                xlsx_digest = row_digest(xlsx_row)
-                if src_digest != xlsx_digest:
-                    msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
-                    logger.warning(msg)
-                    stats.validation_issues.append(msg)
-                    break   # one warning per sheet regardless of level
+            else:
+                # deep: every row — report all mismatches + total
+                mismatch_count = 0
+                for row_idx in range(n):
+                    src_digest  = row_digest(fs.df.iloc[row_idx].values)
+                    xlsx_row    = next(ws_chk.iter_rows(
+                        min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                    ))
+                    if src_digest != row_digest(xlsx_row):
+                        mismatch_count += 1
+                        msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}"
+                        logger.warning(msg)
+                        stats.validation_issues.append(msg)
+                if mismatch_count > 0:
+                    logger.warning(
+                        f"  → {mismatch_count}/{n} row(s) with data divergence in '{fs.record.orig_name}'"
+                    )
         wb_check.close()
 
         # Apply formatting
-        autofit_rows = args.autofit_rows if args.autofit_rows is not None else MAX_AUTOFIT_ROWS
+        autofit_rows = args.autofit_rows   # 0 = disabled, N = row cap
         fmt_mode     = args.format
         logger.info(f"Applying formatting (mode: {fmt_mode})...")
         wb = load_workbook(tmp_path)
