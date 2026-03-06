@@ -15,6 +15,7 @@ load_dotenv()
 
 import argparse
 import logging
+import math
 import os
 import re
 import shutil
@@ -22,7 +23,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 import pandas as pd
@@ -43,6 +44,22 @@ INDEX_TAB        = "INDEX"
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _normalize(v) -> str:
+    """Normalize cell values for write validation: NaN/None → '', whole floats → int, dates → ISO."""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if math.isnan(v):
+            return ""
+        if v == int(v):
+            return str(int(v))
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, date):
+        return v.strftime("%Y-%m-%d")
+    return str(v).strip()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dump Smartsheet workspaces to Excel")
@@ -57,6 +74,8 @@ def parse_args() -> argparse.Namespace:
                    help="Discover and list sheets without writing any file")
     p.add_argument("--log-every", type=int, default=10,
                    help="Log progress every N sheets (default: 10)")
+    p.add_argument("--workers",   type=int, default=MAX_WORKERS,
+                   help=f"Parallel fetch workers (default: {MAX_WORKERS})")
     return p.parse_args()
 
 
@@ -111,10 +130,11 @@ def with_retry(fn, *args, logger, **kwargs):
                 time.sleep(delay)
             else:
                 raise
-        except (ConnectionError, TimeoutError, OSError) as e:
+        except (ConnectionError, TimeoutError, OSError,
+                smartsheet.exceptions.SystemMaintenanceError) as e:
             if attempt <= MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(f"Network error (attempt {attempt}/{MAX_RETRIES}), retry in {delay:.1f}s: {e}")
+                logger.warning(f"Network error (attempt {attempt}/{MAX_RETRIES}), retry in {delay:.1f}s: {type(e).__name__}: {e}")
                 time.sleep(delay)
             else:
                 raise
@@ -139,8 +159,6 @@ def unique_tab_name(raw_name: str, sheet_id: int, seen: dict) -> str:
     seen[tab_name.lower()] = 0
     return tab_name
 
-
-RESERVED_TABS = {"INDEX", "RUN_SUMMARY", "SKIPPED"}
 
 def _safe_reserved_name(base: str, seen: dict) -> str:
     """Return a tab name that doesn't collide with real sheets."""
@@ -316,7 +334,7 @@ def build_index_sheet(wb, manifest: list, index_tab: str):
 
 
 # ── SUMMARY / SKIPPED TABS ───────────────────────────────────────────────────
-def build_summary_sheet(wb, stats: "ExportStats", args, manifest: list, summary_name: str, skipped_name: str):
+def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipped_name: str):
     """RUN_SUMMARY tab: operational evidence inside the workbook."""
     ws = wb.create_sheet(summary_name)
     ws.column_dimensions["A"].width = 28
@@ -355,23 +373,6 @@ def build_summary_sheet(wb, stats: "ExportStats", args, manifest: list, summary_
         auto_fit_columns(skipped_ws)
 
 
-# ── ARCHIVE ──────────────────────────────────────────────────────────────────
-def archive_existing(output_file: str, logger):
-    if not os.path.exists(output_file):
-        return
-    os.makedirs(ARCHIVE_DIR, exist_ok=True)
-    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem    = os.path.splitext(os.path.basename(output_file))[0]
-    archive = os.path.join(ARCHIVE_DIR, f"{stem}_{ts}.xlsx")
-    try:
-        shutil.copy2(output_file, archive)
-        os.remove(output_file)
-        logger.info(f"Archived → {archive}")
-    except Exception as e:
-        logger.error(f"Archive failed ({e}). Aborting to protect existing file.")
-        sys.exit(1)
-
-
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     args   = parse_args()
@@ -408,7 +409,7 @@ def main():
     t_start  = time.time()
     fetched  = {}   # sheet_id → (record, df | None, error | None)
 
-    logger.info(f"Fetching {len(records)} sheet(s) with up to {MAX_WORKERS} parallel workers...")
+    logger.info(f"Fetching {len(records)} sheet(s) with up to {max(1, args.workers)} parallel workers...")
 
     def fetch_one(record):
         # Each thread gets its own client instance — avoids shared-state concurrency risk
@@ -416,7 +417,7 @@ def main():
         thread_client.errors_as_exceptions(True)
         return record, extract_sheet(thread_client, record, args.values, logger)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {executor.submit(fetch_one, r): r for r in records}
         done    = 0
         for future in as_completed(futures):
@@ -457,16 +458,40 @@ def main():
         for fs in manifest:
             fs.df.to_excel(writer, sheet_name=fs.tab_name, index=False)
 
-    # Post-write row count validation
+    # Post-write validation: row counts + header sets
     logger.info("Validating output...")
     wb_check = load_workbook(tmp_path, read_only=True)
     for fs in manifest:
-        if fs.tab_name in wb_check.sheetnames:
-            written = wb_check[fs.tab_name].max_row - 1  # subtract header row
-            if written != len(fs.df):
-                msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
-                logger.warning(msg)
-                stats.row_mismatches.append(msg)
+        if fs.tab_name not in wb_check.sheetnames:
+            stats.row_mismatches.append(f"Missing tab '{fs.record.orig_name}'")
+            continue
+        ws_chk  = wb_check[fs.tab_name]
+        written = ws_chk.max_row - 1
+        if written != len(fs.df):
+            msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
+            logger.warning(msg)
+            stats.row_mismatches.append(msg)
+        # Header check: compare written column names against DataFrame columns
+        written_headers = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
+        expected_headers = list(fs.df.columns)
+        if written_headers != expected_headers:
+            msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
+            logger.warning(msg)
+            stats.row_mismatches.append(msg)
+        # Sampled cell integrity: hash up to 5 data rows from source vs written
+        if len(fs.df) > 0:
+            sample_size = min(5, len(fs.df))
+            for row_idx in range(sample_size):
+                src_hash  = hash(tuple(_normalize(v) for v in fs.df.iloc[row_idx].values))
+                xlsx_row  = next(ws_chk.iter_rows(
+                    min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                ))
+                xlsx_hash = hash(tuple(_normalize(v) for v in xlsx_row))
+                if src_hash != xlsx_hash:
+                    msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
+                    logger.warning(msg)
+                    stats.row_mismatches.append(msg)
+                    break
     wb_check.close()
 
     # Apply formatting
@@ -485,11 +510,10 @@ def main():
     stats.elapsed  = time.time() - t_start
     summary_name = safe_summary_name(seen_tabs)
     skipped_name = safe_skipped_name(seen_tabs)
-    build_summary_sheet(wb, stats, args, manifest, summary_name, skipped_name)
+    build_summary_sheet(wb, stats, args, summary_name, skipped_name)
     wb.save(tmp_path)
 
-    # Atomic promotion: os.replace is atomic on same filesystem
-    # Archive the old file AFTER the new one is safely in place
+    # Archive prior output first (copy only), then atomically replace with new file via os.replace()
     if os.path.exists(args.output):
         os.makedirs(ARCHIVE_DIR, exist_ok=True)
         ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
