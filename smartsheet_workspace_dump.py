@@ -17,11 +17,13 @@ import re
 import os
 import shutil
 import sys
+import time
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 API_TOKEN    = os.environ.get("SMARTSHEET_API_TOKEN", "")
 WORKSPACE_ID = os.environ.get("SMARTSHEET_WORKSPACE_ID", None)  # None = ALL workspaces
 OUTPUT_FILE  = "smartsheet.xlsx"
+LOG_EVERY_N  = 10   # print progress ticker every N sheets
 # ────────────────────────────────────────────────────────────────────────────
 
 # Fail fast if token is missing
@@ -42,6 +44,27 @@ def sanitize_sheet_name(name: str, fallback: str = "Sheet") -> str:
     """Excel tab names: max 31 chars, no special chars. Fallback if result is empty."""
     name = re.sub(r"[\\/*?\[\]:]", "", name).strip()
     return name[:31] if name else fallback[:31]
+
+
+def unique_tab_name(raw_name: str, sheet_id: int, seen: dict) -> str:
+    """
+    Return a unique, case-insensitive, 31-char-safe Excel tab name.
+    seen: {lower_tab_name: count} — tracks names already assigned.
+    """
+    base = sanitize_sheet_name(raw_name, fallback=f"Sheet_{sheet_id}")
+    key  = base.lower()
+
+    if key not in seen:
+        seen[key] = 0
+        return base
+
+    seen[key] += 1
+    suffix = f"_{seen[key]}"
+    # Trim base so base + suffix fits within 31 chars
+    trimmed = base[:31 - len(suffix)]
+    tab_name = trimmed + suffix
+    seen[tab_name.lower()] = 0   # register the new unique name
+    return tab_name
 
 
 def get_all_sheet_ids() -> list[tuple[str, int]]:
@@ -76,11 +99,11 @@ def sheet_to_dataframe(sheet) -> pd.DataFrame:
     Maps cells by column_id (not position) to handle sparse/out-of-order rows.
     """
     col_id_to_title = {col.id: col.title for col in sheet.columns}
-    col_titles = [col.title for col in sheet.columns]
+    col_titles      = [col.title for col in sheet.columns]
 
     rows = []
     for row in sheet.rows:
-        row_data = {title: None for title in col_titles}  # pre-fill all columns
+        row_data = {title: None for title in col_titles}
         for cell in row.cells:
             title = col_id_to_title.get(cell.column_id)
             if title:
@@ -91,16 +114,13 @@ def sheet_to_dataframe(sheet) -> pd.DataFrame:
 
 
 def style_header_row(ws):
-    """Apply professional header styling to row 1."""
     header_fill  = PatternFill("solid", start_color="1F3864")
     header_font  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
     center_align = Alignment(horizontal="center", vertical="center")
-
     for cell in ws[1]:
         cell.fill      = header_fill
         cell.font      = header_font
         cell.alignment = center_align
-
     ws.row_dimensions[1].height = 20
 
 
@@ -111,26 +131,22 @@ def auto_fit_columns(ws):
 
 
 def build_index_sheet(wb, sheet_manifest: list[tuple[str, str, int, int]]):
-    """First tab: clickable index of all exported sheets."""
     idx = wb.create_sheet("INDEX", 0)
     idx.append(["#", "Sheet Name", "Rows", "Smartsheet ID"])
     style_header_row(idx)
-
     for i, (tab_name, orig_name, row_count, sheet_id) in enumerate(sheet_manifest, start=1):
         idx.append([i, orig_name, row_count, sheet_id])
         cell = idx.cell(row=i + 1, column=2)
         safe = f"'{tab_name}'" if " " in tab_name else tab_name
         cell.hyperlink = f"#{safe}!A1"
         cell.font = Font(color="0070C0", underline="single", name="Arial", size=10)
-
     auto_fit_columns(idx)
 
 
 def archive_existing():
-    """Rename smartsheet.xlsx → smartsheet_TIMESTAMP.xlsx using copy+delete for cross-fs safety."""
     if not os.path.exists(OUTPUT_FILE):
         return
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
     archive = f"smartsheet_{ts}.xlsx"
     shutil.copy2(OUTPUT_FILE, archive)
     os.remove(OUTPUT_FILE)
@@ -142,44 +158,44 @@ def main():
 
     print("Fetching sheet list...")
     sheet_list = get_all_sheet_ids()
-    print(f"Found {len(sheet_list)} sheets.")
+    total = len(sheet_list)
+    print(f"Found {total} sheets.\n")
 
-    writer = pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl")
-    pd.DataFrame().to_excel(writer, sheet_name="INDEX", index=False)
+    manifest  = []
+    seen_names = {}   # lower-cased keys for case-insensitive deduplication
+    errors    = []
+    t_start   = time.time()
 
-    manifest = []
-    seen_names = {}
-    errors = []
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        pd.DataFrame().to_excel(writer, sheet_name="INDEX", index=False)
 
-    for orig_name, sheet_id in sheet_list:
-        print(f"  Pulling: {orig_name}")
-        try:
-            sheet = client.Sheets.get_sheet(sheet_id)
-            df = sheet_to_dataframe(sheet)
-
-            tab_name = sanitize_sheet_name(orig_name, fallback=f"Sheet_{sheet_id}")
-            if tab_name in seen_names:
-                seen_names[tab_name] += 1
-                suffix = f"_{seen_names[tab_name]}"
-                tab_name = sanitize_sheet_name(orig_name, fallback=f"Sheet_{sheet_id}")[:31 - len(suffix)] + suffix
+        for i, (orig_name, sheet_id) in enumerate(sheet_list, start=1):
+            # Progress ticker
+            if i == 1 or i % LOG_EVERY_N == 0 or i == total:
+                elapsed = time.time() - t_start
+                print(f"  [{i}/{total}] {orig_name}  ({elapsed:.1f}s elapsed)")
             else:
-                seen_names[tab_name] = 0
+                print(f"  [{i}/{total}] {orig_name}")
 
-            df.to_excel(writer, sheet_name=tab_name, index=False)
-            manifest.append((tab_name, orig_name, len(df), sheet_id))
+            try:
+                sheet    = client.Sheets.get_sheet(sheet_id)
+                df       = sheet_to_dataframe(sheet)
+                tab_name = unique_tab_name(orig_name, sheet_id, seen_names)
 
-        except smartsheet.exceptions.ApiError as e:
-            msg = f"  SKIPPED '{orig_name}': API error {e.message}"
-            print(msg)
-            errors.append(msg)
-        except Exception as e:
-            msg = f"  SKIPPED '{orig_name}': {type(e).__name__}: {e}"
-            print(msg)
-            errors.append(msg)
+                df.to_excel(writer, sheet_name=tab_name, index=False)
+                manifest.append((tab_name, orig_name, len(df), sheet_id))
 
-    writer.close()
+            except smartsheet.exceptions.ApiError as e:
+                msg = f"  SKIPPED '{orig_name}': API error {e.message}"
+                print(msg)
+                errors.append(msg)
+            except Exception as e:
+                msg = f"  SKIPPED '{orig_name}': {type(e).__name__}: {e}"
+                print(msg)
+                errors.append(msg)
 
-    print("Applying formatting...")
+    # Post-process formatting
+    print("\nApplying formatting...")
     wb = load_workbook(OUTPUT_FILE)
 
     for tab_name, _, _, _ in manifest:
@@ -195,7 +211,9 @@ def main():
 
     wb.save(OUTPUT_FILE)
 
-    print(f"\nDone. Exported {len(manifest)} sheets → {OUTPUT_FILE}")
+    elapsed_total = time.time() - t_start
+    print(f"\nDone. Exported {len(manifest)} sheets → {OUTPUT_FILE}  ({elapsed_total:.1f}s total)")
+
     if errors:
         print(f"\n{len(errors)} sheet(s) skipped:")
         for e in errors:
