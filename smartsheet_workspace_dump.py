@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import hashlib
 import logging
 import math
 import os
@@ -81,13 +82,17 @@ def parse_args() -> argparse.Namespace:
 
 # ── LOGGING ──────────────────────────────────────────────────────────────────
 def setup_logging(level: str) -> logging.Logger:
-    logger = logging.getLogger("ss_dump")
+    logger    = logging.getLogger("ss_dump")
+    log_level = getattr(logging, level, logging.INFO)
+    logger.setLevel(log_level)                      # always refresh level
     if logger.handlers:
-        return logger  # already configured — prevent duplicate handlers
-    logger.setLevel(getattr(logging, level, logging.INFO))
+        for h in logger.handlers:                   # refresh level on existing handlers too
+            h.setLevel(log_level)
+        return logger
     fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", "%Y-%m-%d %H:%M:%S")
     for h in [logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE, encoding="utf-8")]:
         h.setFormatter(fmt)
+        h.setLevel(log_level)
         logger.addHandler(h)
     return logger
 
@@ -107,13 +112,13 @@ class FetchedSheet:
 
 @dataclass
 class ExportStats:
-    total_found:    int   = 0
-    exported:       int   = 0
-    skipped_type:   int   = 0
-    skipped_error:  int   = 0
-    row_mismatches: list  = field(default_factory=list)
-    errors:         list  = field(default_factory=list)
-    elapsed:        float = 0.0
+    total_found:       int   = 0
+    exported:          int   = 0
+    skipped_type:      int   = 0
+    skipped_error:     int   = 0
+    validation_issues: list  = field(default_factory=list)
+    errors:            list  = field(default_factory=list)
+    elapsed:           float = 0.0
 
 
 # ── RETRY ────────────────────────────────────────────────────────────────────
@@ -301,10 +306,19 @@ def style_header_row(ws):
     ws.row_dimensions[1].height = 20
 
 
+MAX_AUTOFIT_ROWS = 50   # sample cap to keep formatting fast on large sheets
+
 def auto_fit_columns(ws):
-    for col in ws.columns:
-        width = max((len(str(c.value)) if c.value else 0) for c in col)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = min(width + 4, 60)
+    col_widths = {}
+    for i, row in enumerate(ws.iter_rows()):
+        if i >= MAX_AUTOFIT_ROWS:
+            break
+        for cell in row:
+            if cell.value:
+                col_letter = get_column_letter(cell.column)
+                col_widths[col_letter] = max(col_widths.get(col_letter, 0), len(str(cell.value)))
+    for col_letter, width in col_widths.items():
+        ws.column_dimensions[col_letter].width = min(width + 4, 60)
 
 
 def build_index_sheet(wb, manifest: list, index_tab: str):
@@ -351,7 +365,7 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         ("Sheets exported",  stats.exported),
         ("Skipped (type)",   stats.skipped_type),
         ("Skipped (error)",  stats.skipped_error),
-        ("Row mismatches",   len(stats.row_mismatches)),
+        ("Validation issues", len(stats.validation_issues)),
     ]
     for r in rows:
         ws.append(r)
@@ -362,13 +376,13 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
             if cell.value:
                 cell.font = style_header
 
-    if stats.errors or stats.row_mismatches:
+    if stats.errors or stats.validation_issues:
         skipped_ws = wb.create_sheet(skipped_name)
         skipped_ws.append(["Sheet Name", "Reason"])
         style_header_row(skipped_ws)
         for msg in stats.errors:
             skipped_ws.append(["", msg])
-        for msg in stats.row_mismatches:
+        for msg in stats.validation_issues:
             skipped_ws.append(["", f"ROW MISMATCH: {msg}"])
         auto_fit_columns(skipped_ws)
 
@@ -450,7 +464,7 @@ def main():
 
     index_tab = safe_index_name(seen_tabs)
     stem, ext = os.path.splitext(args.output)
-    tmp_path  = f"{stem}_tmp{ext or '.xlsx'}"
+    tmp_path  = f"{stem}_tmp_{os.getpid()}_{datetime.now().strftime('%H%M%S')}{ext or '.xlsx'}"
 
     # Write to temp file (crash-safe: real file untouched until validated)
     with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
@@ -463,34 +477,40 @@ def main():
     wb_check = load_workbook(tmp_path, read_only=True)
     for fs in manifest:
         if fs.tab_name not in wb_check.sheetnames:
-            stats.row_mismatches.append(f"Missing tab '{fs.record.orig_name}'")
+            stats.validation_issues.append(f"Missing tab '{fs.record.orig_name}'")
             continue
         ws_chk  = wb_check[fs.tab_name]
         written = ws_chk.max_row - 1
         if written != len(fs.df):
             msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
             logger.warning(msg)
-            stats.row_mismatches.append(msg)
+            stats.validation_issues.append(msg)
         # Header check: compare written column names against DataFrame columns
         written_headers = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
         expected_headers = list(fs.df.columns)
         if written_headers != expected_headers:
             msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
             logger.warning(msg)
-            stats.row_mismatches.append(msg)
+            stats.validation_issues.append(msg)
         # Sampled cell integrity: hash up to 5 data rows from source vs written
         if len(fs.df) > 0:
+            def row_digest(values):
+                h = hashlib.sha256()
+                for v in values:
+                    h.update(_normalize(v).encode())
+                return h.hexdigest()
+
             sample_size = min(5, len(fs.df))
             for row_idx in range(sample_size):
-                src_hash  = hash(tuple(_normalize(v) for v in fs.df.iloc[row_idx].values))
-                xlsx_row  = next(ws_chk.iter_rows(
+                src_digest  = row_digest(fs.df.iloc[row_idx].values)
+                xlsx_row    = next(ws_chk.iter_rows(
                     min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
                 ))
-                xlsx_hash = hash(tuple(_normalize(v) for v in xlsx_row))
-                if src_hash != xlsx_hash:
+                xlsx_digest = row_digest(xlsx_row)
+                if src_digest != xlsx_digest:
                     msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
                     logger.warning(msg)
-                    stats.row_mismatches.append(msg)
+                    stats.validation_issues.append(msg)
                     break
     wb_check.close()
 
@@ -538,9 +558,9 @@ def main():
     logger.info(f"Exported:        {stats.exported}")
     logger.info(f"Skipped (type):  {stats.skipped_type}")
     logger.info(f"Skipped (error): {stats.skipped_error}")
-    if stats.row_mismatches:
-        logger.warning(f"Row mismatches:  {len(stats.row_mismatches)}")
-        for m in stats.row_mismatches:
+    if stats.validation_issues:
+        logger.warning(f"Validation issues: {len(stats.validation_issues)}")
+        for m in stats.validation_issues:
             logger.warning(f"  {m}")
     if stats.errors:
         logger.error("Errors:")
