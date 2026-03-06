@@ -1,13 +1,18 @@
 """
-Smartsheet Full Workspace Dump → Excel
+Smartsheet Full Workspace Dump → Excel / CSV / Parquet
 
 Requirements:
     pip install smartsheet-python-sdk openpyxl pandas python-dotenv
+    pip install pyarrow   # only required for --output-format parquet
 
 Usage:
     python smartsheet_workspace_dump.py
     python smartsheet_workspace_dump.py --workspace-id 123 --output dump.xlsx
     python smartsheet_workspace_dump.py --values both --log-level DEBUG --dry-run
+    python smartsheet_workspace_dump.py --row-metadata
+    python smartsheet_workspace_dump.py --output-format csv
+    python smartsheet_workspace_dump.py --output-format both
+    python smartsheet_workspace_dump.py --include-regex "waverly" --max-sheets 5
 """
 
 from dotenv import load_dotenv
@@ -44,6 +49,7 @@ RETRY_BASE_DELAY = 2.0
 MAX_WORKERS      = 5
 INDENT_COL       = "_Indent_Level"
 INDEX_TAB        = "INDEX"
+ROW_META_COLS    = ["_Row_ID", "_Parent_Row_ID", "_Row_Number", "_Created_At", "_Modified_At"]
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -85,6 +91,10 @@ def parse_args() -> argparse.Namespace:
                    help="Skip sheets whose name matches this regex (case-insensitive)")
     p.add_argument("--max-sheets",    type=int, default=None,
                    help="Cap total sheets exported (useful for testing)")
+    p.add_argument("--row-metadata",  action="store_true", default=False,
+                   help="Append _Row_ID, _Parent_Row_ID, _Row_Number, _Created_At, _Modified_At to each sheet")
+    p.add_argument("--output-format", choices=["xlsx", "csv", "parquet", "both"], default="xlsx",
+                   help="Output format: xlsx (default), csv, parquet, or both (xlsx + csv)")
     return p.parse_args()
 
 
@@ -261,11 +271,13 @@ def _resolve_col_titles(columns) -> dict:
     return result
 
 
-def extract_sheet(client, record: SheetRecord, value_mode: str, logger) -> Optional[pd.DataFrame]:
+def extract_sheet(client, record: SheetRecord, value_mode: str, logger,
+                  row_metadata: bool = False) -> Optional[pd.DataFrame]:
     """
     Fetch one sheet and return a DataFrame.
     Returns None if the object is not a plain sheet (report, dashboard, etc).
     Includes _Indent_Level column to preserve row hierarchy.
+    Optionally appends row metadata columns when row_metadata=True.
     """
     raw      = with_retry(client.Sheets.get_sheet, record.sheet_id, logger=logger)
     obj_type = getattr(raw, "type", None)
@@ -282,11 +294,13 @@ def extract_sheet(client, record: SheetRecord, value_mode: str, logger) -> Optio
         data_cols = col_titles
 
     all_cols = [INDENT_COL] + data_cols
+    if row_metadata:
+        all_cols = all_cols + ROW_META_COLS
 
     rows = []
     for row in raw.rows:
-        row_data               = dict.fromkeys(all_cols)
-        row_data[INDENT_COL]   = getattr(row, "indent", 0) or 0
+        row_data             = dict.fromkeys(all_cols)
+        row_data[INDENT_COL] = getattr(row, "indent", 0) or 0
         for cell in row.cells:
             title = col_map.get(cell.column_id)
             if not title:
@@ -299,6 +313,16 @@ def extract_sheet(client, record: SheetRecord, value_mode: str, logger) -> Optio
             else:
                 row_data[title]          = display
                 row_data[f"{title}_raw"] = cell.value
+
+        if row_metadata:
+            row_data["_Row_ID"]        = getattr(row, "id", None)
+            row_data["_Parent_Row_ID"] = getattr(row, "parent_id", None)
+            row_data["_Row_Number"]    = getattr(row, "row_number", None)
+            created  = getattr(row, "created_at", None)
+            modified = getattr(row, "modified_at", None)
+            row_data["_Created_At"]  = created.isoformat()  if created  else None
+            row_data["_Modified_At"] = modified.isoformat() if modified else None
+
         rows.append(row_data)
 
     return pd.DataFrame(rows, columns=all_cols)
@@ -401,11 +425,76 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         auto_fit_columns(skipped_ws)
 
 
+# ── SUMMARY LOGGER ───────────────────────────────────────────────────────────
+def _log_summary(stats: "ExportStats", logger, output: str = ""):
+    logger.info("─" * 50)
+    if output:
+        logger.info(f"Output:            {output}")
+    logger.info(f"Elapsed:           {stats.elapsed:.1f}s")
+    logger.info(f"Found:             {stats.total_found}")
+    logger.info(f"Exported:          {stats.exported}")
+    logger.info(f"Skipped (type):    {stats.skipped_type}")
+    logger.info(f"Skipped (error):   {stats.skipped_error}")
+    if stats.validation_issues:
+        logger.warning(f"Validation issues: {len(stats.validation_issues)}")
+        for m in stats.validation_issues:
+            logger.warning(f"  {m}")
+    if stats.errors:
+        logger.error("Errors:")
+        for e in stats.errors:
+            logger.error(f"  {e}")
+    logger.info("─" * 50)
+
+
+# ── FLAT-FILE WRITERS ────────────────────────────────────────────────────────
+def write_csv_output(manifest: list, stem: str, logger) -> str:
+    """Write one CSV per sheet into {stem}_csv/. Returns the output directory path."""
+    out_dir = f"{stem}_csv"
+    os.makedirs(out_dir, exist_ok=True)
+    for fs in manifest:
+        safe_name = re.sub(r"[\\/*?:\[\]]", "_", fs.record.orig_name)
+        path      = os.path.join(out_dir, f"{safe_name}.csv")
+        fs.df.to_csv(path, index=False, encoding="utf-8-sig")  # utf-8-sig for Excel compatibility
+    logger.info(f"CSV output written → {out_dir}/ ({len(manifest)} file(s))")
+    return out_dir
+
+
+def write_parquet_output(manifest: list, stem: str, logger) -> str:
+    """Write one Parquet file per sheet into {stem}_parquet/. Returns the output directory path."""
+    try:
+        import pyarrow  # noqa: F401 — presence check only
+    except ImportError:
+        logger.error("parquet output requires pyarrow. Install it with: pip install pyarrow")
+        sys.exit(1)
+
+    out_dir = f"{stem}_parquet"
+    os.makedirs(out_dir, exist_ok=True)
+    for fs in manifest:
+        safe_name = re.sub(r"[\\/*?:\[\]]", "_", fs.record.orig_name)
+        path      = os.path.join(out_dir, f"{safe_name}.parquet")
+        fs.df.to_parquet(path, index=False)
+    logger.info(f"Parquet output written → {out_dir}/ ({len(manifest)} file(s))")
+    return out_dir
+
+
+def _check_parquet_early(fmt: str, logger):
+    """Fail fast before any API calls if parquet is requested but pyarrow is missing."""
+    if fmt in ("parquet", "both"):
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:
+            logger.error("parquet output requires pyarrow. Install it with: pip install pyarrow")
+            sys.exit(1)
+
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     args   = parse_args()
     logger = setup_logging(args.log_level)
     log_n  = max(1, args.log_every)
+
+    # Fail fast if parquet requested but pyarrow not installed
+    _check_parquet_early(args.output_format, logger)
 
     # Auth — client created inside main, no module-level side effects
     token = os.environ.get("SMARTSHEET_API_TOKEN", "")
@@ -459,7 +548,8 @@ def main():
         # Each thread gets its own client instance — avoids shared-state concurrency risk
         thread_client = smartsheet.Smartsheet(token)
         thread_client.errors_as_exceptions(True)
-        return record, extract_sheet(thread_client, record, args.values, logger)
+        return record, extract_sheet(thread_client, record, args.values, logger,
+                                     row_metadata=args.row_metadata)
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {executor.submit(fetch_one, r): r for r in records}
@@ -494,116 +584,112 @@ def main():
 
     index_tab = safe_index_name(seen_tabs)
     stem, ext = os.path.splitext(args.output)
-    tmp_path  = f"{stem}_tmp_{uuid.uuid4().hex[:8]}{ext or '.xlsx'}"
+    fmt       = args.output_format
 
-    # Write to temp file (crash-safe: real file untouched until validated)
-    with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-        pd.DataFrame().to_excel(writer, sheet_name=index_tab, index=False)
-        for fs in manifest:
-            fs.df.to_excel(writer, sheet_name=fs.tab_name, index=False)
-
-    # Post-write validation: row counts + header sets
-    logger.info("Validating output...")
-    wb_check = load_workbook(tmp_path, read_only=True)
-    for fs in manifest:
-        if fs.tab_name not in wb_check.sheetnames:
-            stats.validation_issues.append(f"Missing tab '{fs.record.orig_name}'")
-            continue
-        ws_chk  = wb_check[fs.tab_name]
-        written = ws_chk.max_row - 1
-        if written != len(fs.df):
-            msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
-            logger.warning(msg)
-            stats.validation_issues.append(msg)
-        # Header check: compare written column names against DataFrame columns
-        written_headers = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
-        expected_headers = list(fs.df.columns)
-        if written_headers != expected_headers:
-            msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
-            logger.warning(msg)
-            stats.validation_issues.append(msg)
-        # Sampled cell integrity: first, middle, last + up to 3 random rows
-        if len(fs.df) > 0:
-            n = len(fs.df)
-            candidates = sorted(set([
-                0,
-                n // 2,
-                n - 1,
-                *random.sample(range(n), min(3, n))
-            ]))
-
-            def row_digest(values):
-                h = hashlib.sha256()
-                for v in values:
-                    h.update(_normalize(v).encode())
-                return h.hexdigest()
-
-            for row_idx in candidates:
-                src_digest  = row_digest(fs.df.iloc[row_idx].values)
-                xlsx_row    = next(ws_chk.iter_rows(
-                    min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
-                ))
-                xlsx_digest = row_digest(xlsx_row)
-                if src_digest != xlsx_digest:
-                    msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
-                    logger.warning(msg)
-                    stats.validation_issues.append(msg)
-                    break
-    wb_check.close()
-
-    # Apply formatting
-    logger.info("Applying formatting...")
-    wb = load_workbook(tmp_path)
-    for fs in manifest:
-        if fs.tab_name in wb.sheetnames:
-            ws = wb[fs.tab_name]
-            style_header_row(ws)
-            auto_fit_columns(ws)
-            ws.freeze_panes = "A2"
-    if index_tab in wb.sheetnames:
-        del wb[index_tab]
-    build_index_sheet(wb, manifest, index_tab)
     stats.exported = len(manifest)
     stats.elapsed  = time.time() - t_start
-    summary_name = safe_summary_name(seen_tabs)
-    skipped_name = safe_skipped_name(seen_tabs)
-    build_summary_sheet(wb, stats, args, summary_name, skipped_name)
-    wb.save(tmp_path)
 
-    # Archive prior output first (copy only), then atomically replace with new file via os.replace()
-    if os.path.exists(args.output):
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
-        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stem2, _   = os.path.splitext(os.path.basename(args.output))
-        old_backup = os.path.join(ARCHIVE_DIR, f"{stem2}_{ts}.xlsx")
+    # ── CSV output ──────────────────────────────────────────────────────────
+    if fmt in ("csv", "both"):
+        write_csv_output(manifest, stem, logger)
+
+    # ── Parquet output ──────────────────────────────────────────────────────
+    if fmt == "parquet":
+        write_parquet_output(manifest, stem, logger)
+        _log_summary(stats, logger, output=f"{stem}_parquet/")
+        return
+
+    # ── XLSX output (default; also written for "both") ───────────────────────
+    if fmt in ("xlsx", "both"):
+        tmp_path = f"{stem}_tmp_{uuid.uuid4().hex[:8]}{ext or '.xlsx'}"
+
+        # Write to temp file (crash-safe: real file untouched until validated)
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+            pd.DataFrame().to_excel(writer, sheet_name=index_tab, index=False)
+            for fs in manifest:
+                fs.df.to_excel(writer, sheet_name=fs.tab_name, index=False)
+
+        # Post-write validation: row counts + headers + sampled cell hashes
+        logger.info("Validating output...")
+        wb_check = load_workbook(tmp_path, read_only=True)
+        for fs in manifest:
+            if fs.tab_name not in wb_check.sheetnames:
+                stats.validation_issues.append(f"Missing tab '{fs.record.orig_name}'")
+                continue
+            ws_chk  = wb_check[fs.tab_name]
+            written = ws_chk.max_row - 1
+            if written != len(fs.df):
+                msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
+                logger.warning(msg)
+                stats.validation_issues.append(msg)
+            written_headers  = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
+            expected_headers = list(fs.df.columns)
+            if written_headers != expected_headers:
+                msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
+                logger.warning(msg)
+                stats.validation_issues.append(msg)
+            if len(fs.df) > 0:
+                n          = len(fs.df)
+                candidates = sorted(set([0, n // 2, n - 1,
+                                         *random.sample(range(n), min(3, n))]))
+
+                def row_digest(values):
+                    h = hashlib.sha256()
+                    for v in values:
+                        h.update(_normalize(v).encode())
+                    return h.hexdigest()
+
+                for row_idx in candidates:
+                    src_digest  = row_digest(fs.df.iloc[row_idx].values)
+                    xlsx_row    = next(ws_chk.iter_rows(
+                        min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                    ))
+                    xlsx_digest = row_digest(xlsx_row)
+                    if src_digest != xlsx_digest:
+                        msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
+                        logger.warning(msg)
+                        stats.validation_issues.append(msg)
+                        break
+        wb_check.close()
+
+        # Apply formatting
+        logger.info("Applying formatting...")
+        wb = load_workbook(tmp_path)
+        for fs in manifest:
+            if fs.tab_name in wb.sheetnames:
+                ws = wb[fs.tab_name]
+                style_header_row(ws)
+                auto_fit_columns(ws)
+                ws.freeze_panes = "A2"
+        if index_tab in wb.sheetnames:
+            del wb[index_tab]
+        build_index_sheet(wb, manifest, index_tab)
+        summary_name = safe_summary_name(seen_tabs)
+        skipped_name = safe_skipped_name(seen_tabs)
+        build_summary_sheet(wb, stats, args, summary_name, skipped_name)
+        wb.save(tmp_path)
+
+        # Archive prior output, then atomically promote temp file
+        if os.path.exists(args.output):
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+            ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stem2, _   = os.path.splitext(os.path.basename(args.output))
+            old_backup = os.path.join(ARCHIVE_DIR, f"{stem2}_{ts}.xlsx")
+            try:
+                shutil.copy2(args.output, old_backup)
+                logger.info(f"Archived previous output → {old_backup}")
+            except Exception as e:
+                logger.warning(f"Archive failed ({e}). Continuing — previous file will be overwritten.")
+
         try:
-            shutil.copy2(args.output, old_backup)
-            logger.info(f"Archived previous output → {old_backup}")
+            os.replace(tmp_path, args.output)
         except Exception as e:
-            logger.warning(f"Archive failed ({e}). Continuing — previous file will be overwritten.")
+            logger.error(f"Failed to promote temp file: {e}")
+            sys.exit(1)
 
-    try:
-        os.replace(tmp_path, args.output)
-    except Exception as e:
-        logger.error(f"Failed to promote temp file: {e}")
-        sys.exit(1)
+        logger.info(f"XLSX written → {args.output}")
 
-    logger.info("─" * 50)
-    logger.info(f"Output:          {args.output}")
-    logger.info(f"Elapsed:         {stats.elapsed:.1f}s")
-    logger.info(f"Found:           {stats.total_found}")
-    logger.info(f"Exported:        {stats.exported}")
-    logger.info(f"Skipped (type):  {stats.skipped_type}")
-    logger.info(f"Skipped (error): {stats.skipped_error}")
-    if stats.validation_issues:
-        logger.warning(f"Validation issues: {len(stats.validation_issues)}")
-        for m in stats.validation_issues:
-            logger.warning(f"  {m}")
-    if stats.errors:
-        logger.error("Errors:")
-        for e in stats.errors:
-            logger.error(f"  {e}")
-    logger.info("─" * 50)
+    _log_summary(stats, logger, output=args.output)
 
 
 if __name__ == "__main__":
