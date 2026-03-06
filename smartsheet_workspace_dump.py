@@ -38,10 +38,10 @@ except smartsheet.exceptions.ApiError as e:
     sys.exit(f"ERROR: Smartsheet authentication failed: {e.message}")
 
 
-def sanitize_sheet_name(name: str) -> str:
-    """Excel tab names: max 31 chars, no special chars."""
-    name = re.sub(r"[\\/*?\[\]:]", "", name)
-    return name[:31]
+def sanitize_sheet_name(name: str, fallback: str = "Sheet") -> str:
+    """Excel tab names: max 31 chars, no special chars. Fallback if result is empty."""
+    name = re.sub(r"[\\/*?\[\]:]", "", name).strip()
+    return name[:31] if name else fallback[:31]
 
 
 def get_all_sheet_ids() -> list[tuple[str, int]]:
@@ -157,10 +157,11 @@ def main():
             sheet = client.Sheets.get_sheet(sheet_id)
             df = sheet_to_dataframe(sheet)
 
-            tab_name = sanitize_sheet_name(orig_name)
+            tab_name = sanitize_sheet_name(orig_name, fallback=f"Sheet_{sheet_id}")
             if tab_name in seen_names:
                 seen_names[tab_name] += 1
-                tab_name = sanitize_sheet_name(f"{tab_name}_{seen_names[tab_name]}")
+                suffix = f"_{seen_names[tab_name]}"
+                tab_name = sanitize_sheet_name(orig_name, fallback=f"Sheet_{sheet_id}")[:31 - len(suffix)] + suffix
             else:
                 seen_names[tab_name] = 0
 
