@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
                    help="Single workspace ID (default: all workspaces)")
     p.add_argument("--output",    default=DEFAULT_OUTPUT,
                    help="Output .xlsx filename")
-    p.add_argument("--values",    choices=["raw", "display", "both"], default="display",
-                   help="Cell value export mode (default: display)")
+    p.add_argument("--values",    choices=["raw", "display", "both"], default="both",
+                   help="Cell value export mode (default: both)")
     p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     p.add_argument("--dry-run",   action="store_true",
                    help="Discover and list sheets without writing any file")
@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
 # ── LOGGING ──────────────────────────────────────────────────────────────────
 def setup_logging(level: str) -> logging.Logger:
     logger = logging.getLogger("ss_dump")
+    if logger.handlers:
+        return logger  # already configured — prevent duplicate handlers
     logger.setLevel(getattr(logging, level, logging.INFO))
     fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", "%Y-%m-%d %H:%M:%S")
     for h in [logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE, encoding="utf-8")]:
@@ -109,7 +111,7 @@ def with_retry(fn, *args, logger, **kwargs):
                 time.sleep(delay)
             else:
                 raise
-        except Exception as e:
+        except (ConnectionError, TimeoutError, OSError) as e:
             if attempt <= MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning(f"Network error (attempt {attempt}/{MAX_RETRIES}), retry in {delay:.1f}s: {e}")
@@ -138,12 +140,23 @@ def unique_tab_name(raw_name: str, sheet_id: int, seen: dict) -> str:
     return tab_name
 
 
-def safe_index_name(seen: dict) -> str:
-    """Return an INDEX tab name that doesn't collide with any real sheet."""
-    name = INDEX_TAB
+RESERVED_TABS = {"INDEX", "RUN_SUMMARY", "SKIPPED"}
+
+def _safe_reserved_name(base: str, seen: dict) -> str:
+    """Return a tab name that doesn't collide with real sheets."""
+    name = base
     while name.lower() in seen:
         name += "_"
     return name
+
+def safe_index_name(seen: dict) -> str:
+    return _safe_reserved_name(INDEX_TAB, seen)
+
+def safe_summary_name(seen: dict) -> str:
+    return _safe_reserved_name("RUN_SUMMARY", seen)
+
+def safe_skipped_name(seen: dict) -> str:
+    return _safe_reserved_name("SKIPPED", seen)
 
 
 # ── DISCOVERY ────────────────────────────────────────────────────────────────
@@ -190,7 +203,16 @@ def discover_sheets(client, workspace_id: Optional[str], logger) -> list:
                 records.append(SheetRecord(s.name, s.id, "(Home)"))
 
     logger.info(f"Discovered {len(records)} sheet(s) across {len(workspaces)} workspace(s)")
-    return records
+
+    # Final dedup pass — guard against duplicates across recursive paths
+    seen_ids, deduped = set(), []
+    for r in records:
+        if r.sheet_id not in seen_ids:
+            seen_ids.add(r.sheet_id)
+            deduped.append(r)
+    if len(deduped) < len(records):
+        logger.warning(f"Removed {len(records) - len(deduped)} duplicate sheet(s) after discovery")
+    return deduped
 
 
 # ── EXTRACTION ───────────────────────────────────────────────────────────────
@@ -294,9 +316,9 @@ def build_index_sheet(wb, manifest: list, index_tab: str):
 
 
 # ── SUMMARY / SKIPPED TABS ───────────────────────────────────────────────────
-def build_summary_sheet(wb, stats: "ExportStats", args, manifest: list):
+def build_summary_sheet(wb, stats: "ExportStats", args, manifest: list, summary_name: str, skipped_name: str):
     """RUN_SUMMARY tab: operational evidence inside the workbook."""
-    ws = wb.create_sheet("RUN_SUMMARY")
+    ws = wb.create_sheet(summary_name)
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 60
 
@@ -323,7 +345,7 @@ def build_summary_sheet(wb, stats: "ExportStats", args, manifest: list):
                 cell.font = style_header
 
     if stats.errors or stats.row_mismatches:
-        skipped_ws = wb.create_sheet("SKIPPED")
+        skipped_ws = wb.create_sheet(skipped_name)
         skipped_ws.append(["Sheet Name", "Reason"])
         style_header_row(skipped_ws)
         for msg in stats.errors:
@@ -389,7 +411,10 @@ def main():
     logger.info(f"Fetching {len(records)} sheet(s) with up to {MAX_WORKERS} parallel workers...")
 
     def fetch_one(record):
-        return record, extract_sheet(client, record, args.values, logger)
+        # Each thread gets its own client instance — avoids shared-state concurrency risk
+        thread_client = smartsheet.Smartsheet(token)
+        thread_client.errors_as_exceptions(True)
+        return record, extract_sheet(thread_client, record, args.values, logger)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_one, r): r for r in records}
@@ -423,7 +448,8 @@ def main():
         manifest.append(FetchedSheet(record=record, df=df, tab_name=tab_name))
 
     index_tab = safe_index_name(seen_tabs)
-    tmp_path  = args.output.replace(".xlsx", "_tmp.xlsx")
+    stem, ext = os.path.splitext(args.output)
+    tmp_path  = f"{stem}_tmp{ext or '.xlsx'}"
 
     # Write to temp file (crash-safe: real file untouched until validated)
     with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
@@ -457,12 +483,29 @@ def main():
     build_index_sheet(wb, manifest, index_tab)
     stats.exported = len(manifest)
     stats.elapsed  = time.time() - t_start
-    build_summary_sheet(wb, stats, args, manifest)
+    summary_name = safe_summary_name(seen_tabs)
+    skipped_name = safe_skipped_name(seen_tabs)
+    build_summary_sheet(wb, stats, args, manifest, summary_name, skipped_name)
     wb.save(tmp_path)
 
-    # Archive old output, promote temp to final
-    archive_existing(args.output, logger)
-    shutil.move(tmp_path, args.output)
+    # Atomic promotion: os.replace is atomic on same filesystem
+    # Archive the old file AFTER the new one is safely in place
+    if os.path.exists(args.output):
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem2, _   = os.path.splitext(os.path.basename(args.output))
+        old_backup = os.path.join(ARCHIVE_DIR, f"{stem2}_{ts}.xlsx")
+        try:
+            shutil.copy2(args.output, old_backup)
+            logger.info(f"Archived previous output → {old_backup}")
+        except Exception as e:
+            logger.warning(f"Archive failed ({e}). Continuing — previous file will be overwritten.")
+
+    try:
+        os.replace(tmp_path, args.output)
+    except Exception as e:
+        logger.error(f"Failed to promote temp file: {e}")
+        sys.exit(1)
 
     logger.info("─" * 50)
     logger.info(f"Output:          {args.output}")
