@@ -279,7 +279,9 @@ def build_index_sheet(wb, manifest: list, index_tab: str):
         idx.append([i, fs.record.workspace_name, fs.record.orig_name, len(fs.df), fs.record.sheet_id, "", ""])
 
         name_cell = idx.cell(row=i + 1, column=3)
-        safe      = f"'{fs.tab_name}'" if " " in fs.tab_name else fs.tab_name
+        needs_quote = bool(re.search(r"[ '\[\]!]", fs.tab_name))
+        escaped     = fs.tab_name.replace("'", "''")
+        safe        = f"'{escaped}'" if needs_quote else fs.tab_name
         name_cell.hyperlink = f"#{safe}!A1"
         name_cell.font      = Font(color="0070C0", underline="single", name="Arial", size=10)
 
@@ -289,6 +291,46 @@ def build_index_sheet(wb, manifest: list, index_tab: str):
         link_cell.font      = Font(color="0070C0", underline="single", name="Arial", size=10)
 
     auto_fit_columns(idx)
+
+
+# ── SUMMARY / SKIPPED TABS ───────────────────────────────────────────────────
+def build_summary_sheet(wb, stats: "ExportStats", args, manifest: list):
+    """RUN_SUMMARY tab: operational evidence inside the workbook."""
+    ws = wb.create_sheet("RUN_SUMMARY")
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 60
+
+    rows = [
+        ("Run timestamp",    datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Output file",      args.output),
+        ("Value mode",       args.values),
+        ("Workspace filter", args.workspace_id or "All"),
+        ("Elapsed (s)",      f"{stats.elapsed:.1f}"),
+        ("",                 ""),
+        ("Sheets found",     stats.total_found),
+        ("Sheets exported",  stats.exported),
+        ("Skipped (type)",   stats.skipped_type),
+        ("Skipped (error)",  stats.skipped_error),
+        ("Row mismatches",   len(stats.row_mismatches)),
+    ]
+    for r in rows:
+        ws.append(r)
+
+    style_header = Font(bold=True, name="Arial", size=10)
+    for row in ws.iter_rows(min_col=1, max_col=1):
+        for cell in row:
+            if cell.value:
+                cell.font = style_header
+
+    if stats.errors or stats.row_mismatches:
+        skipped_ws = wb.create_sheet("SKIPPED")
+        skipped_ws.append(["Sheet Name", "Reason"])
+        style_header_row(skipped_ws)
+        for msg in stats.errors:
+            skipped_ws.append(["", msg])
+        for msg in stats.row_mismatches:
+            skipped_ws.append(["", f"ROW MISMATCH: {msg}"])
+        auto_fit_columns(skipped_ws)
 
 
 # ── ARCHIVE ──────────────────────────────────────────────────────────────────
@@ -413,15 +455,14 @@ def main():
     if index_tab in wb.sheetnames:
         del wb[index_tab]
     build_index_sheet(wb, manifest, index_tab)
+    stats.exported = len(manifest)
+    stats.elapsed  = time.time() - t_start
+    build_summary_sheet(wb, stats, args, manifest)
     wb.save(tmp_path)
 
     # Archive old output, promote temp to final
     archive_existing(args.output, logger)
     shutil.move(tmp_path, args.output)
-
-    # Final stats
-    stats.exported = len(manifest)
-    stats.elapsed  = time.time() - t_start
 
     logger.info("─" * 50)
     logger.info(f"Output:          {args.output}")
