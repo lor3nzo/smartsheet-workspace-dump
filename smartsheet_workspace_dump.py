@@ -25,9 +25,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import warnings
-# All DeprecationWarnings in this script originate from the Smartsheet SDK
-# (include_all, get_workspace, ssl options). Suppress globally -- our code
-# generates none of its own.
+# Suppress known SDK DeprecationWarnings (include_all, get_workspace, ssl options).
+# The .bat runner also passes -W ignore::DeprecationWarning as the reliable catch-all.
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import argparse
