@@ -17,6 +17,8 @@ Usage:
     python smartsheet_workspace_dump.py --format pretty --autofit-rows 200 --autofit-max-width 80 --validation-level deep
     python smartsheet_workspace_dump.py --no-index --no-summary --format minimal
     python smartsheet_workspace_dump.py --validation-level deep --max-validation-issues 0
+    python smartsheet_workspace_dump.py --since 2026-03-01
+    python smartsheet_workspace_dump.py --since last-run
 """
 
 from dotenv import load_dotenv
@@ -29,6 +31,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=r".*(incl
 
 import argparse
 import hashlib
+import json
 import logging
 import math
 import os
@@ -118,6 +121,10 @@ def parse_args() -> argparse.Namespace:
                    help="Maximum column width in autofit (default: 60). Ignored under --format minimal.")
     p.add_argument("--max-validation-issues", type=int, default=10,
                    help="Max issues logged per sheet in deep validation mode (default: 10, 0=unlimited)")
+    p.add_argument("--since",      default=None,
+                   help="Incremental export: only re-fetch sheets modified after this date (ISO: 2026-01-01) or 'last-run'")
+    p.add_argument("--state-file", default=None,
+                   help="Path to incremental state sidecar JSON (default: {output}.state.json)")
     return p.parse_args()
 
 
@@ -447,6 +454,8 @@ def build_summary_sheet(wb, stats: "ExportStats", args, summary_name: str, skipp
         ("Max issues/sheet", args.max_validation_issues if args.validation_level == "deep" else "n/a"),
         ("Include index",    "no" if args.no_index else "yes"),
         ("Include summary",  "no" if args.no_summary else "yes"),
+        ("Since",            args.since or "full run"),
+        ("State file",       _state_path(args) if args.since else "n/a"),
         ("Workspace filter", args.workspace_id or "All"),
         ("Elapsed (s)",      f"{stats.elapsed:.1f}"),
         ("",                 ""),
@@ -549,62 +558,84 @@ def _prepare_output_dir(out_dir: str, ext: str, logger) -> None:
 
 
 # -- FLAT-FILE WRITERS --------------------------------------------------------
-def write_csv_output(manifest: list, stem: str, logger) -> str:
-    """Write one CSV per sheet into {stem}_csv/. Returns the output directory path."""
-    out_dir    = f"{stem}_csv"
-    _prepare_output_dir(out_dir, ".csv", logger)
-    seen_names = {}
+def write_csv_output(manifest: list, stem: str, logger, run_ts: str = "") -> str:
+    """Write one CSV per sheet into {stem}_csv/{run_ts}/. Copies to _latest/. Returns run dir."""
+    if not run_ts:
+        run_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    base_dir = f"{stem}_csv"
+    run_dir  = os.path.join(base_dir, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+
+    seen_names    = {}
     manifest_rows = []
     for fs in manifest:
         filename = _unique_filename(fs.record.orig_name, fs.record.sheet_id, seen_names)
-        path     = os.path.join(out_dir, f"{filename}.csv")
-        fs.df.to_csv(path, index=False, encoding="utf-8-sig")  # utf-8-sig for Excel compatibility
+        path     = os.path.join(run_dir, f"{filename}.csv")
+        fs.df.to_csv(path, index=False, encoding="utf-8-sig")
         manifest_rows.append({
-            "sheet_name":     fs.record.orig_name,
-            "workspace":      fs.record.workspace_name,
-            "sheet_id":       fs.record.sheet_id,
-            "rows":           len(fs.df),
-            "file":           f"{filename}.csv",
+            "sheet_name": fs.record.orig_name,
+            "workspace":  fs.record.workspace_name,
+            "sheet_id":   fs.record.sheet_id,
+            "rows":       len(fs.df),
+            "file":       f"{filename}.csv",
         })
 
-    # Write manifest CSV alongside the output files
-    manifest_path = os.path.join(out_dir, "_manifest.csv")
-    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(manifest_rows).to_csv(
+        os.path.join(run_dir, "_manifest.csv"), index=False, encoding="utf-8-sig"
+    )
 
-    logger.info(f"CSV output written -> {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
-    return out_dir
+    # _latest/ = stable pointer to most recent run
+    latest_dir = os.path.join(base_dir, "_latest")
+    if os.path.isdir(latest_dir):
+        shutil.rmtree(latest_dir)
+    shutil.copytree(run_dir, latest_dir)
+
+    logger.info(f"CSV output written -> {run_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
+    logger.info(f"  _latest/ updated -> {latest_dir}/")
+    return run_dir
 
 
-def write_parquet_output(manifest: list, stem: str, logger) -> str:
-    """Write one Parquet file per sheet into {stem}_parquet/. Returns the output directory path."""
+def write_parquet_output(manifest: list, stem: str, logger, run_ts: str = "") -> str:
+    """Write one Parquet per sheet into {stem}_parquet/{run_ts}/. Copies to _latest/. Returns run dir."""
     try:
         import pyarrow  # noqa: F401 -- presence check only
     except ImportError:
         logger.error("parquet output requires pyarrow. Install it with: pip install pyarrow")
         sys.exit(1)
 
-    out_dir    = f"{stem}_parquet"
-    _prepare_output_dir(out_dir, ".parquet", logger)
-    seen_names = {}
+    if not run_ts:
+        run_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    base_dir = f"{stem}_parquet"
+    run_dir  = os.path.join(base_dir, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+
+    seen_names    = {}
     manifest_rows = []
     for fs in manifest:
         filename = _unique_filename(fs.record.orig_name, fs.record.sheet_id, seen_names)
-        path     = os.path.join(out_dir, f"{filename}.parquet")
+        path     = os.path.join(run_dir, f"{filename}.parquet")
         fs.df.to_parquet(path, index=False)
         manifest_rows.append({
-            "sheet_name":     fs.record.orig_name,
-            "workspace":      fs.record.workspace_name,
-            "sheet_id":       fs.record.sheet_id,
-            "rows":           len(fs.df),
-            "file":           f"{filename}.parquet",
+            "sheet_name": fs.record.orig_name,
+            "workspace":  fs.record.workspace_name,
+            "sheet_id":   fs.record.sheet_id,
+            "rows":       len(fs.df),
+            "file":       f"{filename}.parquet",
         })
 
-    # Write manifest CSV alongside the parquet files
-    manifest_path = os.path.join(out_dir, "_manifest.csv")
-    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(manifest_rows).to_csv(
+        os.path.join(run_dir, "_manifest.csv"), index=False, encoding="utf-8-sig"
+    )
 
-    logger.info(f"Parquet output written -> {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
-    return out_dir
+    # _latest/ = stable pointer to most recent run
+    latest_dir = os.path.join(base_dir, "_latest")
+    if os.path.isdir(latest_dir):
+        shutil.rmtree(latest_dir)
+    shutil.copytree(run_dir, latest_dir)
+
+    logger.info(f"Parquet output written -> {run_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
+    logger.info(f"  _latest/ updated -> {latest_dir}/")
+    return run_dir
 
 
 def _check_parquet_early(fmt: str, logger):
@@ -615,6 +646,66 @@ def _check_parquet_early(fmt: str, logger):
         except ImportError:
             logger.error("parquet output requires pyarrow. Install it with: pip install pyarrow")
             sys.exit(1)
+
+
+# -- INCREMENTAL STATE --------------------------------------------------------
+def _state_path(args) -> str:
+    """Resolve sidecar path: explicit --state-file or {output}.state.json."""
+    return args.state_file or f"{args.output}.state.json"
+
+
+def _load_state(path: str, logger) -> dict:
+    """Load sidecar JSON. Returns empty dict on missing/corrupt file."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not read state file {path}: {e}. Treating as full run.")
+        return {}
+
+
+def _save_state(path: str, state: dict, logger) -> None:
+    """Persist sidecar JSON atomically."""
+    tmp = f"{path}.tmp_{uuid.uuid4().hex[:8]}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning(f"Could not save state file {path}: {e}")
+
+
+def _parse_since(since_str: str, state: dict, output_key: str, logger):
+    """
+    Parse --since value into a timezone-naive datetime for comparison.
+    Returns None (full run) if unparseable or no prior state.
+    """
+    if since_str == "last-run":
+        last = state.get(output_key, {}).get("last_run")
+        if not last:
+            logger.info("--since last-run: no prior state found, running full export.")
+            return None
+        try:
+            return datetime.fromisoformat(last)
+        except ValueError:
+            logger.warning(f"--since last-run: corrupt timestamp '{last}', running full export.")
+            return None
+    try:
+        return datetime.fromisoformat(since_str)
+    except ValueError:
+        logger.error(f"--since: invalid date '{since_str}'. Use ISO format (2026-01-01) or 'last-run'.")
+        sys.exit(1)
+
+
+def _read_sheet_from_xlsx(xlsx_path: str, tab_name: str, logger) -> "Optional[pd.DataFrame]":
+    """Read one tab from an existing XLSX back into a DataFrame (cache hit for incremental mode)."""
+    try:
+        return pd.read_excel(xlsx_path, sheet_name=tab_name, engine="openpyxl")
+    except Exception as e:
+        logger.warning(f"Could not read cached tab '{tab_name}' from {xlsx_path}: {e}. Will re-fetch.")
+        return None
 
 
 # -- MAIN ---------------------------------------------------------------------
@@ -692,44 +783,129 @@ def main():
 
     stats = ExportStats(total_found=len(records))
 
+    # -- Incremental state ----------------------------------------------------
+    state_path  = _state_path(args)
+    state       = _load_state(state_path, logger)
+    output_key  = os.path.abspath(args.output)
+    run_ts      = datetime.now().strftime("%Y-%m-%d_%H%M%S")  # shared across all output formats
+
+    since_dt = None
+    if args.since:
+        since_dt = _parse_since(args.since, state, output_key, logger)
+
+    # Partition records: fetch from API vs restore from prior XLSX
+    to_fetch  = records   # default: fetch all
+    to_cache  = []        # records to restore from prior XLSX (incremental only)
+
+    if since_dt is not None:
+        prior_xlsx_exists = os.path.exists(args.output)
+        if not prior_xlsx_exists:
+            logger.warning(
+                f"--since specified but no prior output found at '{args.output}'. "
+                f"Running full export."
+            )
+        else:
+            to_fetch = []
+            to_cache = []
+            for r in records:
+                modified_str = state.get(output_key, {}).get("sheet_modified", {}).get(str(r.sheet_id))
+                if modified_str:
+                    try:
+                        modified_dt = datetime.fromisoformat(modified_str)
+                        if modified_dt <= since_dt:
+                            to_cache.append(r)
+                            continue
+                    except ValueError:
+                        pass   # corrupt timestamp -- fall through to fetch
+                to_fetch.append(r)
+            logger.info(
+                f"Incremental mode (since {since_dt.isoformat()}): "
+                f"{len(to_fetch)} sheet(s) to re-fetch, "
+                f"{len(to_cache)} sheet(s) from cache."
+            )
+
     # Dry run -- list sheets and exit
     if args.dry_run:
         logger.info("DRY RUN -- no files will be written")
         for r in records:
-            logger.info(f"  [{r.workspace_name}]  {r.orig_name}  (id={r.sheet_id})")
+            status = "CACHE" if r in to_cache else "FETCH"
+            logger.info(f"  [{r.workspace_name}]  {r.orig_name}  (id={r.sheet_id})  [{status}]")
         logger.info(f"Total after filters: {len(records)} sheet(s)")
         return
 
-    # Parallel extraction
+    # Parallel extraction (only sheets that need re-fetching)
     t_start  = time.time()
     fetched  = {}   # sheet_id -> (record, df | None, error | None)
 
-    logger.info(f"Fetching {len(records)} sheet(s) with up to {max(1, args.workers)} parallel workers...")
+    if to_fetch:
+        logger.info(f"Fetching {len(to_fetch)} sheet(s) with up to {max(1, args.workers)} parallel workers...")
 
-    def fetch_one(record):
-        # Each thread gets its own client instance -- avoids shared-state concurrency risk
-        thread_client = smartsheet.Smartsheet(token)
-        thread_client.errors_as_exceptions(True)
-        return record, extract_sheet(thread_client, record, args.values, logger,
-                                     row_metadata=args.row_metadata)
+        def fetch_one(record):
+            thread_client = smartsheet.Smartsheet(token)
+            thread_client.errors_as_exceptions(True)
+            return record, extract_sheet(thread_client, record, args.values, logger,
+                                         row_metadata=args.row_metadata)
 
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = {executor.submit(fetch_one, r): r for r in records}
-        done    = 0
-        for future in as_completed(futures):
-            done  += 1
-            record = futures[future]
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+            futures = {executor.submit(fetch_one, r): r for r in to_fetch}
+            done    = 0
+            for future in as_completed(futures):
+                done  += 1
+                record = futures[future]
+                try:
+                    _, df = future.result()
+                    fetched[record.sheet_id] = (record, df, None)
+                    if done == 1 or done % log_n == 0 or done == len(to_fetch):
+                        logger.info(f"  [{done}/{len(to_fetch)}] {record.orig_name}")
+                except Exception as e:
+                    msg = f"SKIPPED '{record.orig_name}': {type(e).__name__}: {e}"
+                    logger.error(msg)
+                    stats.errors.append(msg)
+                    stats.skipped_error += 1
+                    fetched[record.sheet_id] = (record, None, msg)
+
+    # Restore cached sheets from prior XLSX (incremental mode only)
+    if to_cache:
+        logger.info(f"Restoring {len(to_cache)} cached sheet(s) from {args.output}...")
+        # Need the tab name mapping from the prior XLSX to look up by tab
+        prior_tabs = {}
+        if os.path.exists(args.output):
             try:
-                _, df = future.result()
-                fetched[record.sheet_id] = (record, df, None)
-                if done == 1 or done % log_n == 0 or done == len(records):
-                    logger.info(f"  [{done}/{len(records)}] {record.orig_name}")
+                prior_wb = load_workbook(args.output, read_only=True)
+                prior_tabs = {name: name for name in prior_wb.sheetnames}
+                prior_wb.close()
             except Exception as e:
-                msg = f"SKIPPED '{record.orig_name}': {type(e).__name__}: {e}"
-                logger.error(msg)
-                stats.errors.append(msg)
-                stats.skipped_error += 1
-                fetched[record.sheet_id] = (record, None, msg)
+                logger.warning(f"Could not inspect prior XLSX tabs: {e}. Will re-fetch cached sheets.")
+                to_fetch.extend(to_cache)
+                to_cache = []
+
+        for record in to_cache:
+            # Derive the tab name the prior run would have used (best-effort match)
+            tab_name = sanitize_sheet_name(record.orig_name, fallback=f"Sheet_{record.sheet_id}")
+            # Try exact match first, then sanitized
+            matched_tab = prior_tabs.get(tab_name) or prior_tabs.get(record.orig_name)
+            if matched_tab:
+                df = _read_sheet_from_xlsx(args.output, matched_tab, logger)
+            else:
+                df = None
+            if df is not None:
+                fetched[record.sheet_id] = (record, df, None)
+                logger.debug(f"  Cached: {record.orig_name}")
+            else:
+                # Cache miss -- fall back to fresh fetch
+                logger.info(f"  Cache miss for '{record.orig_name}', re-fetching...")
+                thread_client = smartsheet.Smartsheet(token)
+                thread_client.errors_as_exceptions(True)
+                try:
+                    _, df = extract_sheet(thread_client, record, args.values, logger,
+                                          row_metadata=args.row_metadata)
+                    fetched[record.sheet_id] = (record, df, None)
+                except Exception as e:
+                    msg = f"SKIPPED '{record.orig_name}': {type(e).__name__}: {e}"
+                    logger.error(msg)
+                    stats.errors.append(msg)
+                    stats.skipped_error += 1
+                    fetched[record.sheet_id] = (record, None, msg)
 
     # Build manifest in original discovery order
     seen_tabs = {}
@@ -753,16 +929,16 @@ def main():
 
     # -- CSV output ----------------------------------------------------------
     if fmt in ("csv", "both", "all"):
-        write_csv_output(manifest, stem, logger)
+        write_csv_output(manifest, stem, logger, run_ts=run_ts)
         if fmt == "csv":
-            _log_summary(stats, logger, output=f"{stem}_csv/")
+            _log_summary(stats, logger, output=f"{stem}_csv/{run_ts}/")
             return
 
     # -- Parquet output ------------------------------------------------------
     if fmt in ("parquet", "all"):
-        write_parquet_output(manifest, stem, logger)
+        write_parquet_output(manifest, stem, logger, run_ts=run_ts)
         if fmt == "parquet":
-            _log_summary(stats, logger, output=f"{stem}_parquet/")
+            _log_summary(stats, logger, output=f"{stem}_parquet/{run_ts}/")
             return
 
     # -- XLSX output (default; also written for "both" and "all") -------------
@@ -902,6 +1078,19 @@ def main():
             sys.exit(1)
 
         logger.info(f"XLSX written -> {args.output}")
+
+        # Update incremental state sidecar
+        sheet_modified = state.get(output_key, {}).get("sheet_modified", {})
+        for fs in manifest:
+            # Record the run timestamp as the known-good modified marker for each sheet.
+            # On the next --since last-run call, sheets not modified after this will be skipped.
+            sheet_modified[str(fs.record.sheet_id)] = run_ts.replace("_", "T", 1).replace("_", ":", 2)
+        state[output_key] = {
+            "last_run":       datetime.now().isoformat(timespec="seconds"),
+            "sheet_modified": sheet_modified,
+        }
+        _save_state(state_path, state, logger)
+        logger.debug(f"State sidecar updated -> {state_path}")
 
     _log_summary(stats, logger, output=args.output)
 
