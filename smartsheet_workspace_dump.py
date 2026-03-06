@@ -93,8 +93,8 @@ def parse_args() -> argparse.Namespace:
                    help="Cap total sheets exported (useful for testing)")
     p.add_argument("--row-metadata",  action="store_true", default=False,
                    help="Append _Row_ID, _Parent_Row_ID, _Row_Number, _Created_At, _Modified_At to each sheet")
-    p.add_argument("--output-format", choices=["xlsx", "csv", "parquet", "both"], default="xlsx",
-                   help="Output format: xlsx (default), csv, parquet, or both (xlsx + csv)")
+    p.add_argument("--output-format", choices=["xlsx", "csv", "parquet", "both", "all"], default="xlsx",
+                   help="Output format: xlsx (default), csv, parquet, both (xlsx+csv), all (xlsx+csv+parquet)")
     return p.parse_args()
 
 
@@ -446,16 +446,41 @@ def _log_summary(stats: "ExportStats", logger, output: str = ""):
     logger.info("─" * 50)
 
 
+def _unique_filename(orig_name: str, sheet_id: int, seen: dict) -> str:
+    """Return a unique, filesystem-safe filename stem (no extension) for flat-file output."""
+    base = re.sub(r"[\\/*?:\[\]]", "_", orig_name).strip() or f"Sheet_{sheet_id}"
+    key  = base.lower()
+    if key not in seen:
+        seen[key] = 0
+        return base
+    seen[key] += 1
+    return f"{base}_{seen[key]}"
+
+
 # ── FLAT-FILE WRITERS ────────────────────────────────────────────────────────
 def write_csv_output(manifest: list, stem: str, logger) -> str:
     """Write one CSV per sheet into {stem}_csv/. Returns the output directory path."""
-    out_dir = f"{stem}_csv"
+    out_dir    = f"{stem}_csv"
     os.makedirs(out_dir, exist_ok=True)
+    seen_names = {}
+    manifest_rows = []
     for fs in manifest:
-        safe_name = re.sub(r"[\\/*?:\[\]]", "_", fs.record.orig_name)
-        path      = os.path.join(out_dir, f"{safe_name}.csv")
+        filename = _unique_filename(fs.record.orig_name, fs.record.sheet_id, seen_names)
+        path     = os.path.join(out_dir, f"{filename}.csv")
         fs.df.to_csv(path, index=False, encoding="utf-8-sig")  # utf-8-sig for Excel compatibility
-    logger.info(f"CSV output written → {out_dir}/ ({len(manifest)} file(s))")
+        manifest_rows.append({
+            "sheet_name":     fs.record.orig_name,
+            "workspace":      fs.record.workspace_name,
+            "sheet_id":       fs.record.sheet_id,
+            "rows":           len(fs.df),
+            "file":           f"{filename}.csv",
+        })
+
+    # Write manifest CSV alongside the output files
+    manifest_path = os.path.join(out_dir, "_manifest.csv")
+    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
+
+    logger.info(f"CSV output written → {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
     return out_dir
 
 
@@ -467,19 +492,33 @@ def write_parquet_output(manifest: list, stem: str, logger) -> str:
         logger.error("parquet output requires pyarrow. Install it with: pip install pyarrow")
         sys.exit(1)
 
-    out_dir = f"{stem}_parquet"
+    out_dir    = f"{stem}_parquet"
     os.makedirs(out_dir, exist_ok=True)
+    seen_names = {}
+    manifest_rows = []
     for fs in manifest:
-        safe_name = re.sub(r"[\\/*?:\[\]]", "_", fs.record.orig_name)
-        path      = os.path.join(out_dir, f"{safe_name}.parquet")
+        filename = _unique_filename(fs.record.orig_name, fs.record.sheet_id, seen_names)
+        path     = os.path.join(out_dir, f"{filename}.parquet")
         fs.df.to_parquet(path, index=False)
-    logger.info(f"Parquet output written → {out_dir}/ ({len(manifest)} file(s))")
+        manifest_rows.append({
+            "sheet_name":     fs.record.orig_name,
+            "workspace":      fs.record.workspace_name,
+            "sheet_id":       fs.record.sheet_id,
+            "rows":           len(fs.df),
+            "file":           f"{filename}.parquet",
+        })
+
+    # Write manifest CSV alongside the parquet files
+    manifest_path = os.path.join(out_dir, "_manifest.csv")
+    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
+
+    logger.info(f"Parquet output written → {out_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
     return out_dir
 
 
 def _check_parquet_early(fmt: str, logger):
     """Fail fast before any API calls if parquet is requested but pyarrow is missing."""
-    if fmt in ("parquet", "both"):
+    if fmt in ("parquet", "all"):
         try:
             import pyarrow  # noqa: F401
         except ImportError:
@@ -513,14 +552,21 @@ def main():
     # Discovery
     records = discover_sheets(client, args.workspace_id, logger)
 
-    # Apply name filters
+    # Apply name filters — validate regex patterns before any API work
+    def _compile_regex(pattern: str, flag_name: str) -> re.Pattern:
+        try:
+            return re.compile(pattern, re.IGNORECASE)
+        except re.error as e:
+            logger.error(f"Invalid regex for {flag_name}: {repr(pattern)} — {e}")
+            sys.exit(1)
+
     if args.include_regex:
-        pat     = re.compile(args.include_regex, re.IGNORECASE)
+        pat     = _compile_regex(args.include_regex, "--include-regex")
         before  = len(records)
         records = [r for r in records if pat.search(r.orig_name)]
         logger.info(f"--include-regex: kept {len(records)}/{before} sheet(s)")
     if args.exclude_regex:
-        pat     = re.compile(args.exclude_regex, re.IGNORECASE)
+        pat     = _compile_regex(args.exclude_regex, "--exclude-regex")
         before  = len(records)
         records = [r for r in records if not pat.search(r.orig_name)]
         logger.info(f"--exclude-regex: kept {len(records)}/{before} sheet(s)")
@@ -590,17 +636,21 @@ def main():
     stats.elapsed  = time.time() - t_start
 
     # ── CSV output ──────────────────────────────────────────────────────────
-    if fmt in ("csv", "both"):
+    if fmt in ("csv", "both", "all"):
         write_csv_output(manifest, stem, logger)
+        if fmt == "csv":
+            _log_summary(stats, logger, output=f"{stem}_csv/")
+            return
 
     # ── Parquet output ──────────────────────────────────────────────────────
-    if fmt == "parquet":
+    if fmt in ("parquet", "all"):
         write_parquet_output(manifest, stem, logger)
-        _log_summary(stats, logger, output=f"{stem}_parquet/")
-        return
+        if fmt == "parquet":
+            _log_summary(stats, logger, output=f"{stem}_parquet/")
+            return
 
-    # ── XLSX output (default; also written for "both") ───────────────────────
-    if fmt in ("xlsx", "both"):
+    # ── XLSX output (default; also written for "both" and "all") ─────────────
+    if fmt in ("xlsx", "both", "all"):
         tmp_path = f"{stem}_tmp_{uuid.uuid4().hex[:8]}{ext or '.xlsx'}"
 
         # Write to temp file (crash-safe: real file untouched until validated)
