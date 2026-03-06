@@ -25,9 +25,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import warnings
-# Suppress known SDK DeprecationWarnings (include_all, get_workspace, ssl options).
-# The .bat runner also passes -W ignore::DeprecationWarning as the reliable catch-all.
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+# Suppress known SDK DeprecationWarnings by message text.
+# The .bat runner passes -W ignore::DeprecationWarning as interpreter-level catch-all.
+# This filter handles direct `python script.py` invocations.
+for _msg in ("include_all", "get_workspace", "OP_NO_SSL", "OP_NO_TLS"):
+    warnings.filterwarnings("ignore", category=DeprecationWarning, message=f".*{_msg}.*")
 
 import argparse
 import hashlib
@@ -588,11 +590,13 @@ def write_csv_output(manifest: list, stem: str, logger, run_ts: str = "") -> str
         os.path.join(run_dir, "_manifest.csv"), index=False, encoding="utf-8-sig"
     )
 
-    # _latest/ = stable pointer to most recent run
+    # _latest/ = stable pointer to most recent run -- updated atomically
     latest_dir = os.path.join(base_dir, "_latest")
+    latest_tmp = os.path.join(base_dir, f"_latest_tmp_{uuid.uuid4().hex[:8]}")
+    shutil.copytree(run_dir, latest_tmp)
     if os.path.isdir(latest_dir):
         shutil.rmtree(latest_dir)
-    shutil.copytree(run_dir, latest_dir)
+    os.replace(latest_tmp, latest_dir)
 
     logger.info(f"CSV output written -> {run_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
     logger.info(f"  _latest/ updated -> {latest_dir}/")
@@ -631,11 +635,13 @@ def write_parquet_output(manifest: list, stem: str, logger, run_ts: str = "") ->
         os.path.join(run_dir, "_manifest.csv"), index=False, encoding="utf-8-sig"
     )
 
-    # _latest/ = stable pointer to most recent run
+    # _latest/ = stable pointer to most recent run -- updated atomically
     latest_dir = os.path.join(base_dir, "_latest")
+    latest_tmp = os.path.join(base_dir, f"_latest_tmp_{uuid.uuid4().hex[:8]}")
+    shutil.copytree(run_dir, latest_tmp)
     if os.path.isdir(latest_dir):
         shutil.rmtree(latest_dir)
-    shutil.copytree(run_dir, latest_dir)
+    os.replace(latest_tmp, latest_dir)
 
     logger.info(f"Parquet output written -> {run_dir}/ ({len(manifest)} file(s) + _manifest.csv)")
     logger.info(f"  _latest/ updated -> {latest_dir}/")
@@ -727,6 +733,13 @@ def main():
         sys.exit(1)
     if args.max_validation_issues < 0:
         logger.error("--max-validation-issues must be >= 0 (use 0 for unlimited)")
+        sys.exit(1)
+    if args.since and args.output_format in ("csv", "parquet"):
+        logger.error(
+            f"--since is only supported for XLSX-producing output formats "
+            f"(xlsx, both, all). Incremental cache restore requires a prior XLSX. "
+            f"Got --output-format {args.output_format}."
+        )
         sys.exit(1)
 
     _, out_ext = os.path.splitext(args.output)
@@ -867,33 +880,26 @@ def main():
     # Restore cached sheets from prior XLSX (incremental mode only)
     if to_cache:
         logger.info(f"Restoring {len(to_cache)} cached sheet(s) from {args.output}...")
-        # Need the tab name mapping from the prior XLSX to look up by tab
-        prior_tabs = {}
-        if os.path.exists(args.output):
-            try:
-                prior_wb = load_workbook(args.output, read_only=True)
-                prior_tabs = {name: name for name in prior_wb.sheetnames}
-                prior_wb.close()
-            except Exception as e:
-                logger.warning(f"Could not inspect prior XLSX tabs: {e}. Will re-fetch cached sheets.")
-                to_fetch.extend(to_cache)
-                to_cache = []
+        # Load tab name map from sidecar -- exact sheet_id -> tab_name, no guessing
+        prior_sheet_tabs = state.get(output_key, {}).get("sheet_tabs", {})
+        prior_xlsx_ok    = os.path.exists(args.output)
+
+        if not prior_xlsx_ok:
+            logger.warning("Prior XLSX not found -- re-fetching all cached sheets.")
+            to_fetch.extend(to_cache)
+            to_cache = []
 
         for record in to_cache:
-            # Derive the tab name the prior run would have used (best-effort match)
-            tab_name = sanitize_sheet_name(record.orig_name, fallback=f"Sheet_{record.sheet_id}")
-            # Try exact match first, then sanitized
-            matched_tab = prior_tabs.get(tab_name) or prior_tabs.get(record.orig_name)
-            if matched_tab:
-                df = _read_sheet_from_xlsx(args.output, matched_tab, logger)
-            else:
-                df = None
+            tab_name = prior_sheet_tabs.get(str(record.sheet_id))
+            df       = None
+            if tab_name and prior_xlsx_ok:
+                df = _read_sheet_from_xlsx(args.output, tab_name, logger)
             if df is not None:
                 fetched[record.sheet_id] = (record, df, None)
-                logger.debug(f"  Cached: {record.orig_name}")
+                logger.debug(f"  Cached: {record.orig_name} (tab: {tab_name})")
             else:
-                # Cache miss -- fall back to fresh fetch
-                logger.info(f"  Cache miss for '{record.orig_name}', re-fetching...")
+                reason = "no tab mapping in sidecar" if not tab_name else "read failed"
+                logger.info(f"  Cache miss ({reason}) for '{record.orig_name}', re-fetching...")
                 thread_client = smartsheet.Smartsheet(token)
                 thread_client.errors_as_exceptions(True)
                 try:
@@ -961,74 +967,74 @@ def main():
             return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
         for fs in manifest:
+            sheet_issues = []   # per-sheet issue strings -- summarized into stats at end
+
             if fs.tab_name not in wb_check.sheetnames:
-                stats.validation_issues.append(f"Missing tab '{fs.record.orig_name}'")
+                msg = f"Missing tab '{fs.record.orig_name}'"
+                logger.warning(msg)
+                stats.validation_issues.append(msg)
                 continue
             ws_chk  = wb_check[fs.tab_name]
             written = ws_chk.max_row - 1
 
             # All levels: row count
             if written != len(fs.df):
-                msg = f"Row mismatch '{fs.record.orig_name}': expected {len(fs.df)}, got {written}"
-                logger.warning(msg)
-                stats.validation_issues.append(msg)
+                sheet_issues.append(f"row count expected {len(fs.df)} got {written}")
 
-            # All levels: headers (cheap, catches high-value failures)
+            # All levels: headers
             written_headers  = [cell.value for cell in next(ws_chk.iter_rows(min_row=1, max_row=1))]
             expected_headers = list(fs.df.columns)
             if written_headers != expected_headers:
-                msg = f"Header mismatch '{fs.record.orig_name}': expected {expected_headers}, got {written_headers}"
-                logger.warning(msg)
-                stats.validation_issues.append(msg)
+                sheet_issues.append("header mismatch")
 
-            if args.validation_level == "basic" or len(fs.df) == 0:
-                continue
+            if args.validation_level != "basic" and len(fs.df) > 0:
+                n = len(fs.df)
 
-            n = len(fs.df)
+                if args.validation_level == "standard":
+                    rng        = random.Random(fs.record.sheet_id)
+                    candidates = sorted(set([
+                        0, n // 4, n // 2, (3 * n) // 4, n - 1,
+                        *rng.sample(range(n), min(3, n))
+                    ]))
+                    for row_idx in candidates:
+                        src_digest = row_digest(fs.df.iloc[row_idx].values)
+                        xlsx_row   = next(ws_chk.iter_rows(
+                            min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                        ))
+                        if src_digest != row_digest(xlsx_row):
+                            sheet_issues.append(f"cell mismatch at row {row_idx + 1}")
+                            break   # one per sheet in standard mode
 
-            if args.validation_level == "standard":
-                # Sampled rows: quartiles + 3 seeded random -- reproducible per sheet
-                rng        = random.Random(fs.record.sheet_id)
-                candidates = sorted(set([
-                    0, n // 4, n // 2, (3 * n) // 4, n - 1,
-                    *rng.sample(range(n), min(3, n))
-                ]))
-                for row_idx in candidates:
-                    src_digest  = row_digest(fs.df.iloc[row_idx].values)
-                    xlsx_row    = next(ws_chk.iter_rows(
-                        min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
-                    ))
-                    if src_digest != row_digest(xlsx_row):
-                        msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}: data differs after write"
-                        logger.warning(msg)
-                        stats.validation_issues.append(msg)
-                        break   # one warning per sheet in standard mode
+                else:
+                    # deep: all rows, capped logging, per-sheet summary
+                    issue_cap      = args.max_validation_issues
+                    mismatch_count = 0
+                    for row_idx in range(n):
+                        src_digest = row_digest(fs.df.iloc[row_idx].values)
+                        xlsx_row   = next(ws_chk.iter_rows(
+                            min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
+                        ))
+                        if src_digest != row_digest(xlsx_row):
+                            mismatch_count += 1
+                            if issue_cap == 0 or mismatch_count <= issue_cap:
+                                logger.warning(
+                                    f"  [{fs.record.orig_name}] row {row_idx + 1}: cell mismatch"
+                                )
+                    if mismatch_count > 0:
+                        cap_note = (
+                            f", showing first {issue_cap}"
+                            if issue_cap > 0 and mismatch_count > issue_cap else ""
+                        )
+                        sheet_issues.append(
+                            f"{mismatch_count}/{n} row(s) with data divergence{cap_note}"
+                        )
 
-            else:
-                # deep: every row -- report first N mismatches per sheet + total count
-                # 0 = unlimited
-                issue_cap  = args.max_validation_issues
-                mismatch_count = 0
-                for row_idx in range(n):
-                    src_digest  = row_digest(fs.df.iloc[row_idx].values)
-                    xlsx_row    = next(ws_chk.iter_rows(
-                        min_row=row_idx + 2, max_row=row_idx + 2, values_only=True
-                    ))
-                    if src_digest != row_digest(xlsx_row):
-                        mismatch_count += 1
-                        if issue_cap == 0 or mismatch_count <= issue_cap:
-                            msg = f"Cell mismatch '{fs.record.orig_name}' row {row_idx + 1}"
-                            logger.warning(msg)
-                            stats.validation_issues.append(msg)
-                if mismatch_count > 0:
-                    cap_note = (
-                        f" (showing first {issue_cap})"
-                        if issue_cap > 0 and mismatch_count > issue_cap else ""
-                    )
-                    logger.warning(
-                        f"  -> {mismatch_count}/{n} row(s) with data divergence "
-                        f"in '{fs.record.orig_name}'{cap_note}"
-                    )
+            # Emit one summary warning per sheet and store one entry in stats
+            if sheet_issues:
+                summary = f"'{fs.record.orig_name}': {'; '.join(sheet_issues)}"
+                logger.warning(f"Validation issue -- {summary}")
+                stats.validation_issues.append(summary)
+
         wb_check.close()
 
         # Apply formatting
@@ -1079,10 +1085,13 @@ def main():
 
         logger.info(f"XLSX written -> {args.output}")
 
-        # Update incremental state sidecar -- just last_run timestamp.
-        # Next --since last-run call will compare Smartsheet's own modified_at against this value.
+        # Update incremental state sidecar.
+        # sheet_tabs maps sheet_id -> actual tab_name used in this workbook.
+        # Cache restore uses this for exact lookup -- no name guessing.
+        sheet_tabs = {str(fs.record.sheet_id): fs.tab_name for fs in manifest}
         state[output_key] = {
-            "last_run": datetime.now().isoformat(timespec="seconds"),
+            "last_run":   datetime.now().isoformat(timespec="seconds"),
+            "sheet_tabs": sheet_tabs,
         }
         _save_state(state_path, state, logger)
         logger.debug(f"State sidecar updated -> {state_path}")
