@@ -25,9 +25,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import warnings
-# Suppress DeprecationWarnings from the Smartsheet SDK (include_all, get_workspace, ssl options).
-# These originate in SDK internals but surface at our call site -- filter by message text.
-warnings.filterwarnings("ignore", category=DeprecationWarning, message=r".*(include_all|get_workspace|OP_NO_SSL|OP_NO_TLS).*")
+# All DeprecationWarnings in this script originate from the Smartsheet SDK
+# (include_all, get_workspace, ssl options). Suppress globally -- our code
+# generates none of its own.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import argparse
 import hashlib
@@ -150,7 +151,8 @@ def setup_logging(level: str) -> logging.Logger:
 class SheetRecord:
     orig_name:      str
     sheet_id:       int
-    workspace_name: str = ""
+    workspace_name: str      = ""
+    modified_at:    Optional[datetime] = None
 
 @dataclass
 class FetchedSheet:
@@ -243,11 +245,27 @@ def safe_skipped_name(seen: dict) -> str:
 
 
 # -- DISCOVERY ----------------------------------------------------------------
+def _parse_modified_at(sheet_obj) -> Optional[datetime]:
+    """
+    Extract modified_at from a Smartsheet sheet object.
+    The SDK may return a datetime, an ISO string, or None depending on version.
+    Returns timezone-naive datetime or None on any failure.
+    """
+    raw = getattr(sheet_obj, "modified_at", None)
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=None)   # strip tz for consistent naive comparison
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None)
+    except (ValueError, AttributeError):
+        return None
 def _collect_from_folder(folder, workspace_name: str) -> list:
     records = []
     if getattr(folder, "sheets", None):
         for s in folder.sheets:
-            records.append(SheetRecord(s.name, s.id, workspace_name))
+            records.append(SheetRecord(s.name, s.id, workspace_name, _parse_modified_at(s)))
     if getattr(folder, "folders", None):
         for sub in folder.folders:
             records.extend(_collect_from_folder(sub, workspace_name))
@@ -273,7 +291,7 @@ def discover_sheets(client, workspace_id: Optional[str], logger) -> list:
     for ws in workspaces:
         if getattr(ws, "sheets", None):
             for s in ws.sheets:
-                records.append(SheetRecord(s.name, s.id, ws.name))
+                records.append(SheetRecord(s.name, s.id, ws.name, _parse_modified_at(s)))
         if getattr(ws, "folders", None):
             for folder in ws.folders:
                 records.extend(_collect_from_folder(folder, ws.name))
@@ -283,7 +301,7 @@ def discover_sheets(client, workspace_id: Optional[str], logger) -> list:
         home   = with_retry(client.Sheets.list_sheets, logger=logger, include_all=True)
         for s in home.data:
             if s.id not in ws_ids:
-                records.append(SheetRecord(s.name, s.id, "(Home)"))
+                records.append(SheetRecord(s.name, s.id, "(Home)", _parse_modified_at(s)))
 
     logger.info(f"Discovered {len(records)} sheet(s) across {len(workspaces)} workspace(s)")
 
@@ -542,19 +560,6 @@ def _unique_filename(orig_name: str, sheet_id: int, seen: dict) -> str:
     return f"{base}_{seen[key]}"
 
 
-def _prepare_output_dir(out_dir: str, ext: str, logger) -> None:
-    """Create output directory, removing any stale files with the given extension from prior runs."""
-    if os.path.isdir(out_dir):
-        stale = [f for f in os.listdir(out_dir)
-                 if f.endswith(ext) and not f.startswith("_")]
-        for f in stale:
-            try:
-                os.remove(os.path.join(out_dir, f))
-            except OSError as e:
-                logger.warning(f"Could not remove stale file {f}: {e}")
-        if stale:
-            logger.info(f"Cleared {len(stale)} stale {ext} file(s) from {out_dir}/")
-    os.makedirs(out_dir, exist_ok=True)
 
 
 # -- FLAT-FILE WRITERS --------------------------------------------------------
@@ -808,16 +813,12 @@ def main():
             to_fetch = []
             to_cache = []
             for r in records:
-                modified_str = state.get(output_key, {}).get("sheet_modified", {}).get(str(r.sheet_id))
-                if modified_str:
-                    try:
-                        modified_dt = datetime.fromisoformat(modified_str)
-                        if modified_dt <= since_dt:
-                            to_cache.append(r)
-                            continue
-                    except ValueError:
-                        pass   # corrupt timestamp -- fall through to fetch
-                to_fetch.append(r)
+                # Compare Smartsheet's own modified_at against the cutoff.
+                # If modified_at is None (API didn't return it), always re-fetch -- safe default.
+                if r.modified_at is not None and r.modified_at <= since_dt:
+                    to_cache.append(r)
+                else:
+                    to_fetch.append(r)
             logger.info(
                 f"Incremental mode (since {since_dt.isoformat()}): "
                 f"{len(to_fetch)} sheet(s) to re-fetch, "
@@ -1079,15 +1080,10 @@ def main():
 
         logger.info(f"XLSX written -> {args.output}")
 
-        # Update incremental state sidecar
-        sheet_modified = state.get(output_key, {}).get("sheet_modified", {})
-        for fs in manifest:
-            # Record the run timestamp as the known-good modified marker for each sheet.
-            # On the next --since last-run call, sheets not modified after this will be skipped.
-            sheet_modified[str(fs.record.sheet_id)] = run_ts.replace("_", "T", 1).replace("_", ":", 2)
+        # Update incremental state sidecar -- just last_run timestamp.
+        # Next --since last-run call will compare Smartsheet's own modified_at against this value.
         state[output_key] = {
-            "last_run":       datetime.now().isoformat(timespec="seconds"),
-            "sheet_modified": sheet_modified,
+            "last_run": datetime.now().isoformat(timespec="seconds"),
         }
         _save_state(state_path, state, logger)
         logger.debug(f"State sidecar updated -> {state_path}")
